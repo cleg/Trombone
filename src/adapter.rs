@@ -8,7 +8,6 @@ pub(crate) type Attributes = Map<String, Value>;
 
 pub(crate) struct DocumentMetadata {
     pub(crate) source: PathBuf,
-    #[expect(dead_code, reason = "Metadata persistence is not implemented yet")]
     pub(crate) attributes: Attributes,
 }
 
@@ -18,11 +17,17 @@ pub(crate) struct Chunk {
     pub(crate) attributes: Attributes,
 }
 
-pub(crate) struct Document {
+// Chunks may borrow the source text, which must outlive their iterator.
+pub(crate) struct Document<'a> {
     pub(crate) metadata: DocumentMetadata,
-    pub(crate) chunks: Box<dyn Iterator<Item = io::Result<Chunk>>>,
+    pub(crate) chunks: Box<dyn Iterator<Item = Chunk> + 'a>,
 }
 
 pub(crate) trait Adapter {
-    fn open(&self, path: &Path, chunk_size: NonZeroUsize) -> io::Result<Document>;
+    fn open<'a>(
+        &self,
+        path: &Path,
+        source: &'a str,
+        chunk_size: NonZeroUsize,
+    ) -> io::Result<Document<'a>>;
 }

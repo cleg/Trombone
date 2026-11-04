@@ -1,1 +1,5 @@
 /target
+/trombone.db
+/trombone.db-journal
+/trombone.db-wal
+/trombone.db-shm

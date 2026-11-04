@@ -1,0 +1,12 @@
+[ollama]
+url = "http://localhost:11434"
+# Example model; change this before using embeddings.
+model = "embeddinggemma"
+
+[database]
+# Relative to the real config file's directory, following symlinks.
+path = "trombone.sqlite"
+
+[chunking]
+# Maximum chunk size in Unicode characters, not bytes or tokens.
+size = 2000

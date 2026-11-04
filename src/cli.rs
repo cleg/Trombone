@@ -6,6 +6,10 @@ use clap::{Parser, Subcommand};
 #[derive(Debug, Parser)]
 #[command(version, about = "Local content indexing and search")]
 pub(crate) struct Cli {
+    /// Path to the TOML configuration file (default: ~/.config/trombone/trombone.toml)
+    #[arg(long, global = true)]
+    pub(crate) config: Option<PathBuf>,
+
     #[command(subcommand)]
     pub(crate) command: Commands,
 }
@@ -17,8 +21,8 @@ pub(crate) enum Commands {
         path: PathBuf,
 
         /// Maximum chunk size in Unicode characters
-        #[arg(long, default_value = "2000")]
-        chunk_size: NonZeroUsize,
+        #[arg(long)]
+        chunk_size: Option<NonZeroUsize>,
 
         /// Glass mode: stop on the first traversal or processing error
         #[arg(long)]

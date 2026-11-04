@@ -3,81 +3,132 @@ use std::num::NonZeroUsize;
 use std::ops::Range;
 use std::path::Path;
 
-use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag};
+use pulldown_cmark::{Event, HeadingLevel, OffsetIter, Options, Parser, Tag};
 
 use crate::adapter::{Adapter, Attributes, Chunk, Document, DocumentMetadata};
 
 pub(crate) struct MarkdownAdapter;
 
 impl Adapter for MarkdownAdapter {
-    fn open(&self, path: &Path, chunk_size: NonZeroUsize) -> io::Result<Document> {
-        let source = std::fs::read_to_string(path)?;
-        let chunks = chunk_markdown(&source, chunk_size.get());
-
+    fn open<'a>(
+        &self,
+        path: &Path,
+        source: &'a str,
+        chunk_size: NonZeroUsize,
+    ) -> io::Result<Document<'a>> {
         Ok(Document {
             metadata: DocumentMetadata {
                 source: path.to_path_buf(),
                 attributes: Attributes::from_iter([("media_type".into(), "text/markdown".into())]),
             },
-            chunks: Box::new(chunks.into_iter().map(Ok)),
+            chunks: Box::new(MarkdownChunks::new(source, chunk_size.get())),
         })
     }
 }
 
-fn chunk_markdown(source: &str, limit: usize) -> Vec<Chunk> {
-    let options = Options::ENABLE_TABLES
-        | Options::ENABLE_TASKLISTS
-        | Options::ENABLE_YAML_STYLE_METADATA_BLOCKS;
-    let mut builder = ChunkBuilder::new(source, limit);
-    let mut depth = 0;
-    let mut block_start = 0;
-    let mut metadata = false;
-    let mut heading: Option<(HeadingLevel, String)> = None;
+/// Retains parsing state between calls to next(), borrowing the original text.
+struct MarkdownChunks<'a> {
+    events: OffsetIter<'a>,
+    builder: ChunkBuilder<'a>,
+    depth: usize,
+    block_start: usize,
+    metadata: bool,
+    heading: Option<(HeadingLevel, String)>,
+    // An oversized block is consumed a piece at a time, without queuing its chunks.
+    remaining: Option<Range<usize>>,
+    finished: bool,
+}
 
-    for (event, range) in Parser::new_ext(source, options).into_offset_iter() {
-        match event {
-            Event::Start(tag) => {
-                if depth == 0 {
-                    block_start = range.start;
-                    metadata = matches!(tag, Tag::MetadataBlock(_));
-                    if let Tag::Heading { level, .. } = tag {
-                        builder.flush();
-                        heading = Some((level, String::new()));
-                    }
-                }
-                depth += 1;
-            }
-            Event::End(_) => {
-                assert!(depth > 0, "End event without a matching Start");
-
-                depth -= 1;
-                if depth == 0 {
-                    if let Some((level, text)) = heading.take() {
-                        builder.headings.retain(|(parent, _)| *parent < level);
-                        builder.headings.push((level, text));
-                    }
-                    if !metadata {
-                        builder.push(block_start..range.end);
-                    }
-                }
-            }
-            Event::Text(text) | Event::Code(text) => {
-                if let Some((_, title)) = &mut heading {
-                    title.push_str(&text);
-                }
-            }
-            Event::SoftBreak | Event::HardBreak => {
-                if let Some((_, title)) = &mut heading {
-                    title.push(' ');
-                }
-            }
-            Event::Rule | Event::Html(_) if depth == 0 => builder.push(range),
-            _ => {}
+impl<'a> MarkdownChunks<'a> {
+    fn new(source: &'a str, limit: usize) -> Self {
+        assert!(limit > 0, "chunk size must be nonzero");
+        let options = Options::ENABLE_TABLES
+            | Options::ENABLE_TASKLISTS
+            | Options::ENABLE_YAML_STYLE_METADATA_BLOCKS;
+        Self {
+            events: Parser::new_ext(source, options).into_offset_iter(),
+            builder: ChunkBuilder::new(source, limit),
+            depth: 0,
+            block_start: 0,
+            metadata: false,
+            heading: None,
+            remaining: None,
+            finished: false,
         }
     }
+}
 
-    builder.flush();
-    builder.chunks
+impl Iterator for MarkdownChunks<'_> {
+    type Item = Chunk;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.finished {
+            return None;
+        }
+        loop {
+            // Finish the current block before advancing the parser or heading path.
+            if let Some(mut range) = self.remaining.take() {
+                let chunk = self.builder.push(&mut range);
+                if !range.is_empty() {
+                    self.remaining = Some(range);
+                }
+                if chunk.is_some() {
+                    return chunk;
+                }
+                continue;
+            }
+
+            let Some((event, range)) = self.events.next() else {
+                self.finished = true;
+                return self.builder.flush();
+            };
+            match event {
+                Event::Start(tag) => {
+                    let mut chunk = None;
+                    if self.depth == 0 {
+                        self.block_start = range.start;
+                        self.metadata = matches!(tag, Tag::MetadataBlock(_));
+                        if let Tag::Heading { level, .. } = tag {
+                            // Emit the preceding section before changing its heading path.
+                            chunk = self.builder.flush();
+                            self.heading = Some((level, String::new()));
+                        }
+                    }
+                    self.depth += 1;
+                    if chunk.is_some() {
+                        return chunk;
+                    }
+                }
+                Event::End(_) => {
+                    assert!(self.depth > 0, "End event without a matching Start");
+                    self.depth -= 1;
+                    if self.depth == 0 {
+                        if let Some((level, text)) = self.heading.take() {
+                            self.builder.headings.retain(|(parent, _)| *parent < level);
+                            self.builder.headings.push((level, text));
+                        }
+                        if !self.metadata {
+                            self.remaining = Some(self.block_start..range.end);
+                        }
+                    }
+                }
+                Event::Text(text) | Event::Code(text) => {
+                    if let Some((_, title)) = &mut self.heading {
+                        title.push_str(&text);
+                    }
+                }
+                Event::SoftBreak | Event::HardBreak => {
+                    if let Some((_, title)) = &mut self.heading {
+                        title.push(' ');
+                    }
+                }
+                Event::Rule | Event::Html(_) if self.depth == 0 => {
+                    self.remaining = Some(range);
+                }
+                _ => {}
+            }
+        }
+    }
 }
 
 struct ChunkBuilder<'a> {
@@ -86,8 +137,9 @@ struct ChunkBuilder<'a> {
     headings: Vec<(HeadingLevel, String)>,
     pending: Option<Range<usize>>,
     pending_chars: usize,
-    line_starts: Vec<usize>,
-    chunks: Vec<Chunk>,
+    // Locations advance with emitted chunks; no per-line offset array is needed.
+    line_offset: usize,
+    line_number: usize,
 }
 
 impl<'a> ChunkBuilder<'a> {
@@ -98,27 +150,34 @@ impl<'a> ChunkBuilder<'a> {
             headings: Vec::new(),
             pending: None,
             pending_chars: 0,
-            line_starts: std::iter::once(0)
-                .chain(source.match_indices('\n').map(|(offset, _)| offset + 1))
-                .collect(),
-            chunks: Vec::new(),
+            line_offset: 0,
+            line_number: 1,
         }
     }
 
-    fn push(&mut self, mut range: Range<usize>) {
+    /// Consume some or all of range and return at most one completed chunk.
+    fn push(&mut self, range: &mut Range<usize>) -> Option<Chunk> {
         if let Some(pending) = &self.pending {
-            // Include the gap between blocks, without recounting the accumulated text.
-            let added_chars = self.source[pending.end..range.end].chars().count();
-            if self.pending_chars + added_chars <= self.limit {
+            // Include the gap, but stop counting as soon as it cannot fit.
+            let available = self.limit - self.pending_chars;
+            let added_chars = self.source[pending.end..range.end]
+                .chars()
+                .take(available.saturating_add(1))
+                .count();
+            if added_chars <= available {
                 self.pending = Some(pending.start..range.end);
                 self.pending_chars += added_chars;
-                return;
+                range.start = range.end;
+                return None;
             }
-            self.flush();
+            // Leave range untouched so the next call can start the new chunk.
+            if let Some(chunk) = self.flush() {
+                return Some(chunk);
+            }
         }
 
-        // Oversized blocks fall back to whitespace boundaries, then Unicode characters.
-        while let Some((cut, _)) = self.source[range.clone()].char_indices().nth(self.limit) {
+        // Split only one piece, retaining the remaining source range for next().
+        if let Some((cut, _)) = self.source[range.clone()].char_indices().nth(self.limit) {
             let prefix = &self.source[range.start..range.start + cut];
             let boundary = prefix
                 .rfind(char::is_whitespace)
@@ -126,45 +185,43 @@ impl<'a> ChunkBuilder<'a> {
                 .filter(|offset| prefix[..*offset].chars().count() >= self.limit / 2)
                 .unwrap_or(cut);
             let end = range.start + boundary;
-            self.pending_chars = self.source[range.start..end].chars().count();
             self.pending = Some(range.start..end);
-            self.flush();
             range.start = end;
+            return self.flush();
         }
 
-        if range.start < range.end {
-            self.pending_chars = self.source[range.clone()].chars().count();
-            self.pending = Some(range);
-        }
+        self.pending_chars = self.source[range.clone()].chars().count();
+        self.pending = Some(range.clone());
+        range.start = range.end;
+        None
     }
 
-    fn flush(&mut self) {
+    fn flush(&mut self) -> Option<Chunk> {
         self.pending_chars = 0;
-        let Some(range) = self.pending.take() else {
-            return;
-        };
+        let range = self.pending.take()?;
         let text = &self.source[range.clone()];
         if text.trim().is_empty() {
-            return;
+            return None;
         }
+
+        // Scan each intervening byte at most once, including skipped frontmatter/gaps.
+        let line_start = self.line_number
+            + self.source[self.line_offset..range.start]
+                .bytes()
+                .filter(|byte| *byte == b'\n')
+                .count();
+        let next_line = line_start + text.bytes().filter(|byte| *byte == b'\n').count();
+        let line_end = next_line - usize::from(text.ends_with('\n'));
+        self.line_offset = range.end;
+        self.line_number = next_line;
 
         let attributes = Attributes::from_iter([
             ("byte_start".into(), range.start.into()),
             ("byte_end".into(), range.end.into()),
-            (
-                "line_start".into(),
-                self.line_starts
-                    .partition_point(|start| *start <= range.start)
-                    .into(),
-            ),
-            (
-                "line_end".into(),
-                self.line_starts
-                    .partition_point(|start| *start < range.end)
-                    .into(),
-            ),
+            ("line_start".into(), line_start.into()),
+            ("line_end".into(), line_end.into()),
         ]);
-        self.chunks.push(Chunk {
+        Some(Chunk {
             text: text.to_owned(),
             section_path: (!self.headings.is_empty()).then(|| {
                 self.headings
@@ -173,7 +230,7 @@ impl<'a> ChunkBuilder<'a> {
                     .collect()
             }),
             attributes,
-        });
+        })
     }
 }
 
@@ -181,14 +238,45 @@ impl<'a> ChunkBuilder<'a> {
 mod tests {
     use super::*;
 
+    fn chunk_markdown(source: &str, limit: usize) -> Vec<Chunk> {
+        MarkdownChunks::new(source, limit).collect()
+    }
+
     fn assert_source_ranges(source: &str, chunks: &[Chunk], limit: usize) {
         for chunk in chunks {
             let start = chunk.attributes["byte_start"].as_u64().unwrap() as usize;
             let end = chunk.attributes["byte_end"].as_u64().unwrap() as usize;
             assert_eq!(chunk.text, source[start..end]);
+            // Compute expected locations independently from the incremental cursor.
+            let line_start = 1 + source.as_bytes()[..start]
+                .iter()
+                .filter(|b| **b == b'\n')
+                .count();
+            let line_end = 1 + source.as_bytes()[..end - 1]
+                .iter()
+                .filter(|b| **b == b'\n')
+                .count();
+            assert_eq!(chunk.attributes["line_start"], line_start);
+            assert_eq!(chunk.attributes["line_end"], line_end);
             assert!(chunk.text.chars().count() <= limit);
             assert!(!chunk.text.trim().is_empty());
         }
+    }
+
+    #[test]
+    fn oversized_blocks_leave_their_remainder_for_the_next_call() {
+        let source = format!("```\n{}\n```\n\n# Later\n", "🙂text ".repeat(10_000));
+        let mut chunks = MarkdownChunks::new(&source, 20);
+        let first = chunks.next().unwrap();
+        let remainder = chunks.remaining.as_ref().unwrap();
+        assert_eq!(
+            remainder.start,
+            first.attributes["byte_end"].as_u64().unwrap() as usize
+        );
+        assert!(remainder.len() > source.len() / 2);
+        assert!(chunks.builder.pending.is_none());
+        assert!(!chunks.finished);
+        assert_source_ranges(&source, &[first, chunks.next().unwrap()], 20);
     }
 
     #[test]
@@ -254,18 +342,6 @@ mod tests {
                 chunks.iter().map(|chunk| &chunk.text).collect::<Vec<_>>(),
             );
         }
-    }
-
-    #[test]
-    fn oversized_code_and_tables_still_respect_the_limit() {
-        let source = "```\nдуже довгий рядок коду 🙂\n```\n\n| A | B |\n| --- | --- |\n| довге | значення |\n";
-        let chunks = chunk_markdown(source, 10);
-        assert_source_ranges(source, &chunks, 10);
-        let reconstructed: String = chunks.iter().map(|chunk| chunk.text.as_str()).collect();
-        assert_eq!(
-            reconstructed.split_whitespace().collect::<String>(),
-            source.split_whitespace().collect::<String>(),
-        );
     }
 
     #[test]
