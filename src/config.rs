@@ -37,6 +37,7 @@ pub(crate) struct OllamaConfig {
     #[serde(default = "default_ollama_url")]
     pub(crate) url: String,
     pub(crate) model: String,
+    pub(crate) expected_dimensions: Option<NonZeroUsize>,
 }
 
 #[derive(Debug, Deserialize)]

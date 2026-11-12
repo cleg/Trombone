@@ -2,6 +2,7 @@
 url = "http://localhost:11434"
 # Example model; change this before using embeddings.
 model = "embeddinggemma"
+expected_dimensions = 768
 
 [database]
 # Relative to the real config file's directory, following symlinks.

@@ -16,6 +16,15 @@ pub(crate) struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum Commands {
+    /// Generate and check an embedding for the first chunk of a Markdown file
+    ProbeEmbedding {
+        path: PathBuf,
+
+        /// Save, reopen, and search a temporary USearch index
+        #[arg(long)]
+        usearch: bool,
+    },
+
     /// Index Markdown files in a directory
     Index {
         path: PathBuf,

@@ -10,9 +10,9 @@ CREATE INDEX IF NOT EXISTS documents_content_hash ON documents(content_hash);
 
 CREATE TABLE IF NOT EXISTS chunks (
     id INTEGER PRIMARY KEY,
+    vector_key INTEGER NOT NULL UNIQUE CHECK (vector_key > 0),
     content_hash TEXT NOT NULL,
     ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
-    text TEXT NOT NULL,
     section_path TEXT
         CHECK (section_path IS NULL OR
             (json_valid(section_path) AND json_type(section_path) = 'array')),
@@ -31,4 +31,12 @@ END;
 CREATE TABLE IF NOT EXISTS index_config (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     chunk_size INTEGER NOT NULL CHECK (chunk_size > 0)
+);
+
+CREATE TABLE IF NOT EXISTS vector_index (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    file_name TEXT NOT NULL,
+    model TEXT NOT NULL,
+    dimensions INTEGER NOT NULL CHECK (dimensions > 0),
+    next_key INTEGER NOT NULL CHECK (next_key > 0)
 );

@@ -3,17 +3,17 @@ mod adapters;
 mod cli;
 mod config;
 mod database;
+mod indexer;
 mod processor;
+mod vector_probe;
 mod walker;
 
 use clap::Parser;
 use ollama_rs::Ollama;
-use std::ops::ControlFlow;
 use std::process::ExitCode;
 
 use cli::{Cli, Commands};
 use config::Config;
-use walker::Walker;
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -31,44 +31,66 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let _ollama = match Ollama::try_new(&config.ollama.url) {
+    let ollama = match Ollama::try_new(&config.ollama.url) {
         Ok(ollama) => ollama,
         Err(error) => {
             eprintln!("Failed to initialize Ollama client: {error}");
             return ExitCode::FAILURE;
         }
     };
-    // Ollama selects the model per request, not when constructing the client.
-    let _embedding_model = config.ollama.model;
-    let mut database = match database::open(&config.database.path) {
-        Ok(connection) => connection,
-        Err(error) => {
-            eprintln!(
-                "Failed to initialize database {}: {error}",
-                config.database.path.display()
-            );
-            return ExitCode::FAILURE;
-        }
-    };
-
     match cli.command {
+        Commands::ProbeEmbedding { path, usearch } => {
+            let result = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(Box::<dyn std::error::Error + Send + Sync>::from)
+                .and_then(|runtime| {
+                    runtime.block_on(processor::probe_embedding(
+                        &path,
+                        config.chunking.size,
+                        &ollama,
+                        &config.ollama,
+                    ))
+                });
+            match result {
+                Ok(embedding) => {
+                    println!("Embedding dimensions: {}", embedding.len());
+                    if usearch {
+                        match vector_probe::round_trip(&embedding) {
+                            Ok((key, distance)) => {
+                                println!("USearch matched key {key}, cosine distance: {distance}");
+                            }
+                            Err(error) => {
+                                eprintln!("USearch probe failed: {error}");
+                                return ExitCode::FAILURE;
+                            }
+                        }
+                    }
+                }
+                Err(error) => {
+                    eprintln!("Failed to embed first chunk of {}: {error}", path.display());
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
         Commands::Index {
             path,
             chunk_size,
             glass,
         } => {
-            let chunk_size = chunk_size.unwrap_or(config.chunking.size);
-            let walker = Walker {
-                continue_on_error: !glass,
-            };
-            if walker
-                .walk(&path, |file| {
-                    processor::process(file, chunk_size, &mut database)?;
-                    Ok(ControlFlow::Continue(()))
-                })
-                .is_err()
-            {
-                return ExitCode::FAILURE;
+            match indexer::run(
+                &path,
+                chunk_size.unwrap_or(config.chunking.size),
+                glass,
+                &config,
+                &ollama,
+            ) {
+                Ok(true) => {}
+                Ok(false) => return ExitCode::FAILURE,
+                Err(error) => {
+                    eprintln!("Indexing failed: {error}");
+                    return ExitCode::FAILURE;
+                }
             }
         }
         Commands::Search { query, limit } => {

@@ -3,12 +3,54 @@ use std::io;
 use std::num::NonZeroUsize;
 use std::path::Path;
 
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use crate::adapter::{Chunk, Document, DocumentMetadata};
 
 // One result type for SQLite, JSON serialization and document opening errors.
-type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
+pub(crate) type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
+
+pub(crate) struct VectorIndex {
+    pub(crate) file_name: String,
+    pub(crate) model: String,
+    pub(crate) dimensions: i64,
+    pub(crate) next_key: i64,
+}
+
+pub(crate) fn vector_index(connection: &Connection) -> Result<Option<VectorIndex>> {
+    let index = connection
+        .query_row(
+            "SELECT file_name, model, dimensions, next_key FROM vector_index WHERE id = 1",
+            [],
+            |row| {
+                Ok(VectorIndex {
+                    file_name: row.get(0)?,
+                    model: row.get(1)?,
+                    dimensions: row.get(2)?,
+                    next_key: row.get(3)?,
+                })
+            },
+        )
+        .optional()?;
+    if index.is_none()
+        && connection.query_row("SELECT EXISTS(SELECT 1 FROM chunks)", [], |row| {
+            row.get::<_, bool>(0)
+        })?
+    {
+        return Err(io::Error::other("SQLite has chunks but no active USearch index").into());
+    }
+    Ok(index)
+}
+
+pub(crate) fn publish_vector_index(connection: &Connection, index: &VectorIndex) -> Result<()> {
+    connection.execute(
+        "INSERT INTO vector_index (id, file_name, model, dimensions, next_key)
+         VALUES (1, ?1, ?2, ?3, ?4)
+         ON CONFLICT(id) DO UPDATE SET file_name = excluded.file_name, next_key = excluded.next_key",
+        params![index.file_name, index.model, index.dimensions, index.next_key],
+    )?;
+    Ok(())
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum IndexStatus {
@@ -47,34 +89,40 @@ fn initialize(connection: &mut Connection) -> Result<()> {
         }
         transaction.execute_batch("DROP TABLE chunks; DROP TABLE documents;")?;
     }
+    let old_chunks: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('chunks'))
+         AND NOT EXISTS(SELECT 1 FROM pragma_table_info('chunks') WHERE name = 'vector_key')",
+        [],
+        |row| row.get(0),
+    )?;
+    if old_chunks {
+        return Err(io::Error::other("Use a fresh database path for vector indexing").into());
+    }
     // Embed the SQL at compile time; no separate SQL file is needed at runtime.
     transaction.execute_batch(include_str!("schema.sql"))?;
     transaction.commit()?;
     Ok(())
 }
 
-/// Save a new or changed file, sharing chunks with identical content.
-pub(crate) fn save<'a>(
-    connection: &mut Connection,
+/// Save one file inside the caller's transaction or savepoint.
+pub(crate) fn save_file<'a>(
+    connection: &Connection,
     path: &Path,
     content_hash: &str,
     chunk_size: NonZeroUsize,
     load_document: impl FnOnce() -> io::Result<Document<'a>>,
+    next_key: &mut i64,
+    add_vector: impl FnMut(u64, String) -> Result<()>,
 ) -> Result<IndexStatus> {
     // SQLite INTEGER is signed 64-bit; reject sizes that cannot be represented.
     let chunk_size = i64::try_from(chunk_size.get())?;
     let source = path
         .to_str()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Source path must be UTF-8"))?;
-    // Acquire the writer lock before checking existing data, so another writer
-    // cannot change our deduplication decisions before we save the document.
-    // Any error returned through `?` drops this transaction and rolls it back.
-    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     // A content hash identifies shared chunks only under the same chunking settings.
-    ensure_chunk_size(&transaction, chunk_size)?;
+    ensure_chunk_size(connection, chunk_size)?;
     // Skip the adapter entirely when this path still has the same content.
-    if !needs_indexing(&transaction, source, content_hash)? {
-        transaction.commit()?;
+    if !needs_indexing(connection, source, content_hash)? {
         return Ok(IndexStatus::Unchanged);
     }
 
@@ -88,13 +136,17 @@ pub(crate) fn save<'a>(
         .into());
     }
     // Decide reuse using other documents, before replacing this document.
-    let reuse = can_reuse_chunks(&transaction, source, content_hash)?;
-    replace_document(&transaction, source, content_hash, &document.metadata)?;
+    let reuse = can_reuse_chunks(connection, source, content_hash)?;
+    replace_document(connection, source, content_hash, &document.metadata)?;
     if !reuse {
-        save_chunks(&transaction, content_hash, document.chunks)?;
+        save_chunks(
+            connection,
+            content_hash,
+            document.chunks,
+            next_key,
+            add_vector,
+        )?;
     }
-    // Document replacement, trigger cleanup and new chunks become visible together.
-    transaction.commit()?;
     Ok(if reuse {
         IndexStatus::Reused
     } else {
@@ -104,7 +156,7 @@ pub(crate) fn save<'a>(
 
 /// Replace the source's document row without updating its content hash in place.
 fn replace_document(
-    transaction: &Transaction<'_>,
+    transaction: &Connection,
     source: &str,
     content_hash: &str,
     metadata: &DocumentMetadata,
@@ -124,11 +176,7 @@ fn replace_document(
 }
 
 /// Check whether another document already owns a complete chunk set for this hash.
-fn can_reuse_chunks(
-    transaction: &Transaction<'_>,
-    source: &str,
-    content_hash: &str,
-) -> Result<bool> {
+fn can_reuse_chunks(transaction: &Connection, source: &str, content_hash: &str) -> Result<bool> {
     // Check documents rather than chunks: an empty file legitimately has no chunks.
     // Exclude this source so it can never count as its own reusable reference.
     Ok(transaction.query_row(
@@ -140,18 +188,24 @@ fn can_reuse_chunks(
 
 /// Consume the chunk iterator and insert its chunks within the caller's transaction.
 fn save_chunks(
-    transaction: &Transaction<'_>,
+    transaction: &Connection,
     content_hash: &str,
     chunks: impl Iterator<Item = Chunk>,
+    next_key: &mut i64,
+    mut add_vector: impl FnMut(u64, String) -> Result<()>,
 ) -> Result<()> {
     // Prepare once and reuse the statement for every chunk.
     let mut insert = transaction.prepare(
-        "INSERT INTO chunks (content_hash, ordinal, text, section_path, attributes)
+        "INSERT INTO chunks (vector_key, content_hash, ordinal, section_path, attributes)
          VALUES (?1, ?2, ?3, ?4, ?5)",
     )?;
     for (ordinal, chunk) in chunks.enumerate() {
         // enumerate() gives the zero-based position in the document.
         let ordinal = i64::try_from(ordinal)?;
+        let key = *next_key;
+        *next_key = key
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("USearch key space exhausted"))?;
         // Some(path) becomes JSON text; None becomes SQL NULL.
         // transpose() changes Option<Result<...>> into Result<Option<...>>.
         let section_path = chunk
@@ -160,18 +214,19 @@ fn save_chunks(
             .map(serde_json::to_string)
             .transpose()?;
         insert.execute(params![
+            key,
             content_hash,
             ordinal,
-            chunk.text,
             section_path,
             serde_json::to_string(&chunk.attributes)?,
         ])?;
+        add_vector(u64::try_from(key)?, chunk.text)?;
     }
     Ok(())
 }
 
 /// Keep one chunk size for all shared content in a nonempty index.
-fn ensure_chunk_size(transaction: &Transaction<'_>, chunk_size: i64) -> Result<()> {
+fn ensure_chunk_size(transaction: &Connection, chunk_size: i64) -> Result<()> {
     // optional() treats a missing settings row as None instead of an error.
     let stored_size: Option<i64> = transaction
         .query_row(
@@ -202,7 +257,7 @@ fn ensure_chunk_size(transaction: &Transaction<'_>, chunk_size: i64) -> Result<(
 }
 
 /// Index an unseen path or a path whose stored content hash has changed.
-fn needs_indexing(transaction: &Transaction<'_>, source: &str, content_hash: &str) -> Result<bool> {
+fn needs_indexing(transaction: &Connection, source: &str, content_hash: &str) -> Result<bool> {
     let previous_hash: Option<String> = transaction
         .query_row(
             "SELECT content_hash FROM documents WHERE source = ?1",
@@ -217,6 +272,32 @@ fn needs_indexing(transaction: &Transaction<'_>, source: &str, content_hash: &st
 mod tests {
     use super::*;
     use crate::adapter::{Attributes, Chunk, DocumentMetadata};
+
+    fn save<'a>(
+        connection: &mut Connection,
+        path: &Path,
+        hash: &str,
+        chunk_size: NonZeroUsize,
+        load_document: impl FnOnce() -> io::Result<Document<'a>>,
+    ) -> Result<IndexStatus> {
+        let transaction = connection.transaction()?;
+        let mut next_key = transaction.query_row(
+            "SELECT COALESCE(MAX(vector_key), 0) + 1 FROM chunks",
+            [],
+            |row| row.get(0),
+        )?;
+        let status = save_file(
+            &transaction,
+            path,
+            hash,
+            chunk_size,
+            load_document,
+            &mut next_key,
+            |_, _| Ok(()),
+        )?;
+        transaction.commit()?;
+        Ok(status)
+    }
 
     fn document(path: &str, text: &str) -> Document<'static> {
         Document {
