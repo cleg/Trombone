@@ -33,6 +33,7 @@ CREATE TABLE IF NOT EXISTS index_config (
     chunk_size INTEGER NOT NULL CHECK (chunk_size > 0)
 );
 
+-- Singleton row that publishes the active USearch snapshot alongside chunk changes.
 CREATE TABLE IF NOT EXISTS vector_index (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     file_name TEXT NOT NULL,

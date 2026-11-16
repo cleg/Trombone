@@ -28,7 +28,14 @@ pub(crate) struct Config {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct DatabaseConfig {
+    /// Directory that holds the SQLite database and USearch snapshots.
     pub(crate) path: PathBuf,
+}
+
+impl DatabaseConfig {
+    pub(crate) fn sqlite_path(&self) -> PathBuf {
+        self.path.join("trombone.sqlite")
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -68,6 +75,26 @@ impl Config {
                 io::Error::new(io::ErrorKind::InvalidInput, "Config path has no parent")
             })?;
             config.database.path = directory.join(&config.database.path);
+        }
+        let directory = &config.database.path;
+        let metadata = fs::metadata(directory).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "Cannot access database directory {}: {error}",
+                    directory.display()
+                ),
+            )
+        })?;
+        if !metadata.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotADirectory,
+                format!(
+                    "database.path must point to a directory: {}",
+                    directory.display()
+                ),
+            )
+            .into());
         }
         Ok(config)
     }

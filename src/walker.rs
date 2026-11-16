@@ -4,23 +4,38 @@ use std::path::Path;
 
 use walkdir::{DirEntry, WalkDir};
 
-pub(crate) struct Walker {
+pub(crate) struct Walker<'a> {
     pub(crate) continue_on_error: bool,
+    pub(crate) report_error: &'a dyn Fn(&Path, &io::Error),
 }
 
-impl Walker {
-    pub(crate) fn walk<F>(&self, root: &Path, mut processor: F) -> io::Result<()>
+pub(crate) enum InputKind {
+    File,
+    Directory,
+}
+
+impl Walker<'_> {
+    pub(crate) fn walk<F>(&self, root: &Path, mut processor: F) -> io::Result<InputKind>
     where
         F: FnMut(&Path) -> io::Result<ControlFlow<()>>,
     {
         let root =
-            std::path::absolute(root).inspect_err(|error| self.handle_fatal_error(root, error))?;
+            std::path::absolute(root).inspect_err(|error| (self.report_error)(root, error))?;
 
         let metadata =
-            std::fs::metadata(&root).inspect_err(|error| self.handle_fatal_error(&root, error))?;
+            std::fs::metadata(&root).inspect_err(|error| (self.report_error)(&root, error))?;
+        if metadata.is_file() && is_markdown(&root) {
+            if let Err(error) = processor(&root) {
+                self.handle_conditional_error(&root, error)?;
+            }
+            return Ok(InputKind::File);
+        }
         if !metadata.is_dir() {
-            let error = io::Error::new(io::ErrorKind::NotADirectory, "expected a directory");
-            self.handle_fatal_error(&root, &error);
+            let error = io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "expected a Markdown (.md) file or a directory",
+            );
+            (self.report_error)(&root, &error);
             return Err(error);
         }
 
@@ -47,15 +62,11 @@ impl Walker {
             }
         }
 
-        Ok(())
-    }
-
-    fn handle_fatal_error(&self, path: &Path, error: &io::Error) {
-        eprintln!("{}: {error}", path.display());
+        Ok(InputKind::Directory)
     }
 
     fn handle_conditional_error(&self, path: &Path, error: io::Error) -> io::Result<()> {
-        eprintln!("{}: {error}", path.display());
+        (self.report_error)(path, &error);
         if self.continue_on_error {
             Ok(())
         } else {
@@ -71,7 +82,11 @@ fn should_visit(entry: &DirEntry) -> bool {
 }
 
 fn is_supported_file(entry: &DirEntry) -> bool {
-    entry.file_type().is_file() && entry.path().extension().is_some_and(|ext| ext == "md")
+    entry.file_type().is_file() && is_markdown(entry.path())
+}
+
+fn is_markdown(path: &Path) -> bool {
+    path.extension().is_some_and(|ext| ext == "md")
 }
 
 #[cfg(test)]
@@ -116,10 +131,13 @@ mod tests {
     #[test]
     fn invalid_roots_are_fatal_regardless_of_continuation() {
         let directory = TestDirectory::new();
-        directory.write("file.md");
+        directory.write("file.txt");
         for continue_on_error in [true, false] {
-            let walker = Walker { continue_on_error };
-            for name in ["file.md", "missing"] {
+            let walker = Walker {
+                continue_on_error,
+                report_error: &|_, _| {},
+            };
+            for name in ["file.txt", "missing"] {
                 let result = walker.walk(&directory.0.join(name), |_| {
                     panic!("processor must not run")
                 });
@@ -129,13 +147,36 @@ mod tests {
     }
 
     #[test]
+    fn a_file_input_processes_only_that_file() {
+        let directory = TestDirectory::new();
+        directory.write("selected.md");
+        directory.write("neighbor.md");
+        let selected = directory.0.join("selected.md");
+        let mut found = Vec::new();
+        let kind = Walker {
+            continue_on_error: true,
+            report_error: &|_, _| {},
+        }
+        .walk(&selected, |path| {
+            found.push(path.to_path_buf());
+            Ok(ControlFlow::Continue(()))
+        })
+        .unwrap();
+        assert!(matches!(kind, InputKind::File));
+        assert_eq!(found, [selected]);
+    }
+
+    #[test]
     fn processor_errors_continue_or_stop_the_actual_walk() {
         let directory = TestDirectory::new();
         for name in ["a.md", "nested/b.md", "c.md"] {
             directory.write(name);
         }
         for continue_on_error in [true, false] {
-            let walker = Walker { continue_on_error };
+            let walker = Walker {
+                continue_on_error,
+                report_error: &|_, _| {},
+            };
             let mut calls = 0;
             let result = walker.walk(&directory.0, |_| {
                 calls += 1;
@@ -157,12 +198,15 @@ mod tests {
         directory.write("b.md");
         for continue_on_error in [true, false] {
             let mut calls = 0;
-            Walker { continue_on_error }
-                .walk(&directory.0, |_| {
-                    calls += 1;
-                    Ok(ControlFlow::Break(()))
-                })
-                .unwrap();
+            Walker {
+                continue_on_error,
+                report_error: &|_, _| {},
+            }
+            .walk(&directory.0, |_| {
+                calls += 1;
+                Ok(ControlFlow::Break(()))
+            })
+            .unwrap();
             assert_eq!(calls, 1);
         }
     }
@@ -187,6 +231,7 @@ mod tests {
         let mut found = BTreeSet::new();
         Walker {
             continue_on_error: true,
+            report_error: &|_, _| {},
         }
         .walk(&root, |path| {
             assert!(path.is_absolute());

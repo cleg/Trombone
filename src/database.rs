@@ -10,6 +10,7 @@ use crate::adapter::{Chunk, Document, DocumentMetadata};
 // One result type for SQLite, JSON serialization and document opening errors.
 pub(crate) type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 
+/// SQLite's pointer to the active USearch file and the settings used to build it.
 pub(crate) struct VectorIndex {
     pub(crate) file_name: String,
     pub(crate) model: String,
@@ -49,6 +50,19 @@ pub(crate) fn publish_vector_index(connection: &Connection, index: &VectorIndex)
          ON CONFLICT(id) DO UPDATE SET file_name = excluded.file_name, next_key = excluded.next_key",
         params![index.file_name, index.model, index.dimensions, index.next_key],
     )?;
+    Ok(())
+}
+
+pub(crate) fn document_sources(connection: &Connection) -> Result<Vec<String>> {
+    Ok(connection
+        .prepare("SELECT source FROM documents")?
+        .query_map([], |row| row.get(0))?
+        .collect::<rusqlite::Result<_>>()?)
+}
+
+pub(crate) fn delete_document(connection: &Connection, source: &str) -> Result<()> {
+    // The delete trigger drops chunk rows once the last document sharing them is gone.
+    connection.execute("DELETE FROM documents WHERE source = ?1", [source])?;
     Ok(())
 }
 
@@ -202,6 +216,8 @@ fn save_chunks(
     for (ordinal, chunk) in chunks.enumerate() {
         // enumerate() gives the zero-based position in the document.
         let ordinal = i64::try_from(ordinal)?;
+        // Allocate independently of the SQLite row ID. USearch can still hold old keys
+        // after the corresponding chunk rows have been removed.
         let key = *next_key;
         *next_key = key
             .checked_add(1)
@@ -220,6 +236,8 @@ fn save_chunks(
             section_path,
             serde_json::to_string(&chunk.attributes)?,
         ])?;
+        // The caller rolls back this insert if embedding or vector insertion fails.
+        // Only metadata stays in SQLite. The callback takes ownership of the chunk text.
         add_vector(u64::try_from(key)?, chunk.text)?;
     }
     Ok(())

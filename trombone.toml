@@ -1,12 +1,11 @@
 [ollama]
 url = "http://localhost:11434"
-# Example model; change this before using embeddings.
-model = "embeddinggemma"
+model = "embeddinggemma-2:740m-bf16"
 expected_dimensions = 768
 
 [database]
-# Relative to the real config file's directory, following symlinks.
-path = "trombone.sqlite"
+# Existing directory for SQLite and USearch. Relative paths start at the config file.
+path = "."
 
 [chunking]
 # Maximum chunk size in Unicode characters, not bytes or tokens.

@@ -9,21 +9,6 @@ use crate::adapters::markdown::MarkdownAdapter;
 use crate::config::OllamaConfig;
 use crate::database::Result;
 
-pub(crate) async fn probe_embedding(
-    path: &Path,
-    chunk_size: NonZeroUsize,
-    ollama: &Ollama,
-    config: &OllamaConfig,
-) -> Result<Vec<f32>> {
-    let expected = expected_dimensions(config)?;
-    let source = std::fs::read_to_string(path)?;
-    let chunk = open_document(path, &source, chunk_size)?
-        .chunks
-        .next()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "No chunks in the file"))?;
-    embed(ollama, &config.model, expected, chunk.text).await
-}
-
 pub(crate) fn expected_dimensions(config: &OllamaConfig) -> io::Result<NonZeroUsize> {
     config.expected_dimensions.ok_or_else(|| {
         io::Error::new(
@@ -39,6 +24,8 @@ pub(crate) async fn embed(
     expected: NonZeroUsize,
     text: String,
 ) -> Result<Vec<f32>> {
+    // This request sends one text. Ollama uses an array of vectors for both single
+    // and batched input, so extract exactly one vector from the response.
     let request = GenerateEmbeddingsRequest::new(model.to_owned(), text.into());
     let response = ollama.generate_embeddings(request).await?;
     let [embedding] = <[_; 1]>::try_from(response.embeddings).map_err(|embeddings| {
@@ -48,6 +35,7 @@ pub(crate) async fn embed(
         )
     })?;
     let actual = embedding.len();
+    // USearch uses a fixed dimensionality. Validate before passing the vector to it.
     if actual != expected.get() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,

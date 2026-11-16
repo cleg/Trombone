@@ -37,6 +37,7 @@ rustc-ice-*.txt
 *.sqlite3-wal
 *.sqlite3-shm
 .trombone-index-*.usearch
+trombone-index-*.usearch
 .env
 .env.*
 /trombone.local.toml
