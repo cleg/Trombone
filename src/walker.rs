@@ -15,12 +15,17 @@ pub(crate) enum InputKind {
 }
 
 impl Walker<'_> {
+    /// Visit Markdown sources under existing `root` using canonical absolute paths.
+    ///
+    /// `processor` receives each source and may stop traversal with Break. Returns
+    /// the input kind, or a root/traversal/processing error under the chosen policy.
+    /// Root symlinks are resolved; descendant symlinks are not followed.
     pub(crate) fn walk<F>(&self, root: &Path, mut processor: F) -> io::Result<InputKind>
     where
         F: FnMut(&Path) -> io::Result<ControlFlow<()>>,
     {
         let root =
-            std::path::absolute(root).inspect_err(|error| (self.report_error)(root, error))?;
+            std::fs::canonicalize(root).inspect_err(|error| (self.report_error)(root, error))?;
 
         let metadata =
             std::fs::metadata(&root).inspect_err(|error| (self.report_error)(&root, error))?;
@@ -99,6 +104,9 @@ mod tests {
     struct TestDirectory(PathBuf);
 
     impl TestDirectory {
+        /// Create and return a temporary directory with a canonical absolute path.
+        ///
+        /// Panics if temporary storage cannot be created or canonicalized.
         fn new() -> Self {
             static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
             loop {
@@ -108,7 +116,7 @@ mod tests {
                     NEXT_ID.fetch_add(1, Ordering::Relaxed),
                 ));
                 match std::fs::create_dir(&path) {
-                    Ok(()) => return Self(path),
+                    Ok(()) => return Self(std::fs::canonicalize(path).unwrap()),
                     Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
                     Err(error) => panic!("cannot create test directory: {error}"),
                 }

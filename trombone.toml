@@ -2,6 +2,11 @@
 url = "http://localhost:11434"
 model = "embeddinggemma-2:740m-bf16"
 expected_dimensions = 768
+chunk_format = "title: {title} | text: {text}"
+query_format = "task: search result | query: {query}"
+# Time limits in seconds; both must be greater than zero.
+connect_timeout_secs = 10
+request_timeout_secs = 120
 
 [database]
 # Existing directory for SQLite and USearch. Relative paths start at the config file.
@@ -9,4 +14,4 @@ path = "."
 
 [chunking]
 # Maximum chunk size in Unicode characters, not bytes or tokens.
-size = 2000
+size = 1000

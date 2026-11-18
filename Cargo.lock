@@ -1515,6 +1515,7 @@ dependencies = [
  "indicatif",
  "ollama-rs",
  "pulldown-cmark",
+ "reqwest",
  "rusqlite",
  "serde",
  "serde_json",

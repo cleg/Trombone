@@ -1,7 +1,7 @@
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Debug, Parser)]
 #[command(version, about = "Local content indexing and search")]
@@ -16,6 +16,9 @@ pub(crate) struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum Commands {
+    /// Rebuild the vector index from current chunks without regenerating embeddings
+    Compact,
+
     /// Index a Markdown file or all Markdown files in a directory
     Index {
         path: PathBuf,
@@ -27,6 +30,10 @@ pub(crate) enum Commands {
         /// Glass mode: stop on the first traversal or processing error
         #[arg(long)]
         glass: bool,
+
+        /// Defer automatic compaction while retaining accumulated removal counts
+        #[arg(long)]
+        no_compact: bool,
     },
 
     /// Search indexed content
@@ -35,5 +42,15 @@ pub(crate) enum Commands {
 
         #[arg(short, long, default_value_t = 5)]
         limit: usize,
+
+        /// Format for search results
+        #[arg(long, value_enum, default_value_t = OutputFormat::Console)]
+        output: OutputFormat,
     },
+}
+
+#[derive(Clone, Debug, ValueEnum)]
+pub(crate) enum OutputFormat {
+    Console,
+    Json,
 }

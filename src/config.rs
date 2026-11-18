@@ -1,10 +1,12 @@
 use std::error::Error;
 use std::fs;
 use std::io;
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
+
+use crate::embeddings;
 
 pub(crate) fn default_path() -> io::Result<PathBuf> {
     let home = std::env::home_dir().ok_or_else(|| {
@@ -45,6 +47,14 @@ pub(crate) struct OllamaConfig {
     pub(crate) url: String,
     pub(crate) model: String,
     pub(crate) expected_dimensions: Option<NonZeroUsize>,
+    pub(crate) chunk_format: Option<String>,
+    pub(crate) query_format: Option<String>,
+    /// Maximum time allowed to establish an Ollama connection, in seconds.
+    #[serde(default = "default_connect_timeout_secs")]
+    pub(crate) connect_timeout_secs: NonZeroU64,
+    /// Maximum total duration of one Ollama request, in seconds.
+    #[serde(default = "default_request_timeout_secs")]
+    pub(crate) request_timeout_secs: NonZeroU64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -65,10 +75,30 @@ fn default_ollama_url() -> String {
     "http://localhost:11434".to_owned()
 }
 
+/// Return the nonzero default Ollama connection timeout of ten seconds.
+fn default_connect_timeout_secs() -> NonZeroU64 {
+    NonZeroU64::new(10).unwrap()
+}
+
+/// Return the nonzero default total Ollama request timeout of two minutes.
+fn default_request_timeout_secs() -> NonZeroU64 {
+    NonZeroU64::new(120).unwrap()
+}
+
 impl Config {
+    /// Load the TOML configuration at `path` and validate its templates and storage directory.
+    ///
+    /// Returns the configuration with relative database paths resolved against
+    /// the real config file location after following symlinks.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for unreadable or invalid TOML, invalid embedding input
+    /// templates, or an inaccessible or non-directory database location.
     pub(crate) fn load(path: &Path) -> Result<Self, Box<dyn Error>> {
         let text = fs::read_to_string(path)?;
         let mut config: Self = toml::from_str(&text)?;
+        embeddings::validate_formats(&config.ollama)?;
         if config.database.path.is_relative() {
             let config_path = fs::canonicalize(path)?;
             let directory = config_path.parent().ok_or_else(|| {

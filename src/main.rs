@@ -1,21 +1,39 @@
 mod adapter;
 mod adapters;
 mod cli;
+mod compact;
 mod config;
 mod database;
+mod embeddings;
+mod error;
+mod index_report;
 mod indexer;
 mod processor;
+mod progress;
 mod reporter;
+mod search;
+mod search_output;
+mod snapshot;
+mod source_path;
+mod template;
 mod walker;
 
 use clap::Parser;
-use ollama_rs::Ollama;
 use std::process::ExitCode;
 
-use cli::{Cli, Commands};
+use cli::{Cli, Commands, OutputFormat};
 use config::Config;
+use embeddings::OllamaEmbedder;
 use reporter::Reporter;
+use search_output::{ConsoleOutput, JsonOutput, SearchOutput};
 
+/// Dispatch the CLI command using the selected configuration.
+///
+/// Returns success after a complete operation, or failure after reporting a
+/// configuration, indexing, compaction, search, or output error. Indexing forwards
+/// its automatic-compaction preference and derives the exit code from IndexReport.
+/// Indexing initializes its embedding client after acquiring the writer lock.
+/// Progress events are rendered by the console reporter here.
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let config_path = match cli.config.map_or_else(config::default_path, Ok) {
@@ -32,38 +50,86 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let ollama = match Ollama::try_new(&config.ollama.url) {
-        Ok(ollama) => ollama,
-        Err(error) => {
-            Reporter::ollama_init_failed(&error);
-            return ExitCode::FAILURE;
-        }
-    };
+    let mut reporter = Reporter::default();
     match cli.command {
+        Commands::Compact => {
+            let result = compact::run(&config.database, &mut |event| reporter.handle(event))
+                .and_then(|report| {
+                    Reporter::compacted(report.as_ref())?;
+                    Ok(())
+                });
+            if let Err(error) = result {
+                Reporter::compaction_failed(error.as_ref());
+                return ExitCode::FAILURE;
+            }
+        }
         Commands::Index {
             path,
             chunk_size,
             glass,
+            no_compact,
         } => {
-            match indexer::run(
+            let report = indexer::run(
                 &path,
                 chunk_size.unwrap_or(config.chunking.size),
                 glass,
-                &config,
-                &ollama,
-            ) {
-                Ok(true) => {}
-                Ok(false) => return ExitCode::FAILURE,
-                Err(error) => {
-                    Reporter::indexing_failed(error.as_ref());
-                    return ExitCode::FAILURE;
-                }
+                no_compact,
+                &config.database,
+                || {
+                    OllamaEmbedder::new(&config.ollama)
+                        .map(Box::new)
+                        .map_err(|error| {
+                            std::io::Error::other(format!(
+                                "Failed to initialize embeddings: {error}"
+                            ))
+                            .into()
+                        })
+                },
+                &mut |event| reporter.handle(event),
+            );
+            reporter.finish();
+            if let Err(error) = Reporter::indexed(&report) {
+                Reporter::indexing_failed(&error);
+                return ExitCode::FAILURE;
+            }
+            if !report.is_success() {
+                return ExitCode::FAILURE;
             }
         }
-        Commands::Search { query, limit } => {
-            Reporter::search_preview(&query, limit);
+        Commands::Search {
+            query,
+            limit,
+            output,
+        } => {
+            let embedder = match initialize_embedder(&config) {
+                Ok(embedder) => embedder,
+                Err(status) => return status,
+            };
+            let result = search::run(query, limit, &config.database, &embedder).and_then(|hits| {
+                let stdout = std::io::stdout().lock();
+                match output {
+                    OutputFormat::Console => ConsoleOutput::new(stdout).write_results(&hits),
+                    OutputFormat::Json => JsonOutput::new(stdout).write_results(&hits),
+                }?;
+                Ok(())
+            });
+            if let Err(error) = result {
+                Reporter::searching_failed(error.as_ref());
+                return ExitCode::FAILURE;
+            }
         }
     }
 
     ExitCode::SUCCESS
+}
+
+/// Initialize the embedding component using `config` for indexing or search.
+///
+/// Returns the embedder, or a failure exit status after reporting invalid settings
+/// or a runtime initialization error.
+fn initialize_embedder(config: &Config) -> Result<OllamaEmbedder, ExitCode> {
+    OllamaEmbedder::new(&config.ollama).map_err(|error| {
+        Reporter::embedding_init_failed(error.as_ref());
+        ExitCode::FAILURE
+    })
 }

@@ -5,7 +5,7 @@ use std::path::Path;
 
 use pulldown_cmark::{Event, HeadingLevel, OffsetIter, Options, Parser, Tag};
 
-use crate::adapter::{Adapter, Attributes, Chunk, Document, DocumentMetadata};
+use crate::adapter::{Adapter, Attributes, Chunk, Document, DocumentMetadata, SourceLocation};
 
 pub(crate) struct MarkdownAdapter;
 
@@ -106,8 +106,7 @@ impl Iterator for MarkdownChunks<'_> {
                         if let Some((level, text)) = self.heading.take() {
                             self.builder.headings.retain(|(parent, _)| *parent < level);
                             self.builder.headings.push((level, text));
-                        }
-                        if !self.metadata {
+                        } else if !self.metadata {
                             self.remaining = Some(self.block_start..range.end);
                         }
                     }
@@ -196,6 +195,10 @@ impl<'a> ChunkBuilder<'a> {
         None
     }
 
+    /// Emit this builder's pending source span with typed byte and line coordinates.
+    ///
+    /// Returns a chunk and advances the line cursor, or `None` if there is no
+    /// pending span or it contains only whitespace.
     fn flush(&mut self) -> Option<Chunk> {
         self.pending_chars = 0;
         let range = self.pending.take()?;
@@ -215,21 +218,21 @@ impl<'a> ChunkBuilder<'a> {
         self.line_offset = range.end;
         self.line_number = next_line;
 
-        let attributes = Attributes::from_iter([
-            ("byte_start".into(), range.start.into()),
-            ("byte_end".into(), range.end.into()),
-            ("line_start".into(), line_start.into()),
-            ("line_end".into(), line_end.into()),
-        ]);
         Some(Chunk {
             text: text.to_owned(),
+            location: SourceLocation {
+                byte_start: range.start,
+                byte_end: range.end,
+                line_start,
+                line_end,
+            },
             section_path: (!self.headings.is_empty()).then(|| {
                 self.headings
                     .iter()
                     .map(|(_, title)| title.clone())
                     .collect()
             }),
-            attributes,
+            attributes: Attributes::new(),
         })
     }
 }
@@ -242,10 +245,14 @@ mod tests {
         MarkdownChunks::new(source, limit).collect()
     }
 
+    /// Assert that `chunks` reference exact spans of `source` within character `limit`.
+    ///
+    /// Verifies typed byte offsets and computes expected line numbers independently
+    /// of the chunk builder's incremental cursor.
     fn assert_source_ranges(source: &str, chunks: &[Chunk], limit: usize) {
         for chunk in chunks {
-            let start = chunk.attributes["byte_start"].as_u64().unwrap() as usize;
-            let end = chunk.attributes["byte_end"].as_u64().unwrap() as usize;
+            let start = chunk.location.byte_start;
+            let end = chunk.location.byte_end;
             assert_eq!(chunk.text, source[start..end]);
             // Compute expected locations independently from the incremental cursor.
             let line_start = 1 + source.as_bytes()[..start]
@@ -256,29 +263,28 @@ mod tests {
                 .iter()
                 .filter(|b| **b == b'\n')
                 .count();
-            assert_eq!(chunk.attributes["line_start"], line_start);
-            assert_eq!(chunk.attributes["line_end"], line_end);
+            assert_eq!(chunk.location.line_start, line_start);
+            assert_eq!(chunk.location.line_end, line_end);
             assert!(chunk.text.chars().count() <= limit);
             assert!(!chunk.text.trim().is_empty());
         }
     }
 
+    /// Verify oversized blocks retain a remainder after each typed source span is emitted.
     #[test]
     fn oversized_blocks_leave_their_remainder_for_the_next_call() {
         let source = format!("```\n{}\n```\n\n# Later\n", "🙂text ".repeat(10_000));
         let mut chunks = MarkdownChunks::new(&source, 20);
         let first = chunks.next().unwrap();
         let remainder = chunks.remaining.as_ref().unwrap();
-        assert_eq!(
-            remainder.start,
-            first.attributes["byte_end"].as_u64().unwrap() as usize
-        );
+        assert_eq!(remainder.start, first.location.byte_end);
         assert!(remainder.len() > source.len() / 2);
         assert!(chunks.builder.pending.is_none());
         assert!(!chunks.finished);
         assert_source_ranges(&source, &[first, chunks.next().unwrap()], 20);
     }
 
+    /// Verify section ancestry and typed line coordinates across headings and fenced code.
     #[test]
     fn heading_paths_follow_the_hierarchy_and_ignore_fenced_code() {
         let source = "Intro.\n\n# Root\n\n## **Child**\n\n```md\n# Not a heading\n```\n\n## Sibling\n\nText.\n";
@@ -291,12 +297,14 @@ mod tests {
             paths,
             vec![
                 None,
-                Some(vec!["Root".into()]),
                 Some(vec!["Root".into(), "Child".into()]),
                 Some(vec!["Root".into(), "Sibling".into()]),
             ]
         );
-        assert!(chunks[2].text.contains("# Not a heading"));
+        assert_eq!(chunks[1].text, "```md\n# Not a heading\n```");
+        assert_eq!(chunks[1].location.line_start, 7);
+        assert_eq!(chunks[2].text, "Text.\n");
+        assert_eq!(chunks[2].location.line_start, 13);
         assert_source_ranges(source, &chunks, 2000);
     }
 
@@ -315,14 +323,15 @@ mod tests {
         }
     }
 
+    /// Verify omitted metadata does not shift the typed coordinates of merged body blocks.
     #[test]
     fn metadata_is_excluded_and_small_blocks_are_combined() {
         let source = "---\nlanguage: ua\n---\n\nFirst.\n\nSecond.\n";
         let chunks = chunk_markdown(source, 2000);
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].text, "First.\n\nSecond.\n");
-        assert_eq!(chunks[0].attributes["line_start"], 5);
-        assert_eq!(chunks[0].attributes["line_end"], 7);
+        assert_eq!(chunks[0].location.line_start, 5);
+        assert_eq!(chunks[0].location.line_end, 7);
         assert_source_ranges(source, &chunks, 2000);
     }
 
@@ -369,7 +378,12 @@ mod tests {
 
     #[test]
     fn empty_documents_have_no_chunks() {
-        for source in ["", " \n\n", "---\nstatus: draft\n---\n"] {
+        for source in [
+            "",
+            " \n\n",
+            "---\nstatus: draft\n---\n",
+            "# Title\n\n## Section\n",
+        ] {
             assert!(chunk_markdown(source, 2000).is_empty());
         }
     }

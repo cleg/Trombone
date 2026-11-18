@@ -1,5 +1,3 @@
-use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
 use std::fmt::Display;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -7,45 +5,62 @@ use std::time::Duration;
 
 use indicatif::{ProgressBar, ProgressFinish, ProgressStyle};
 
-use crate::database::IndexStatus;
+use crate::compact::CompactReport;
+use crate::index_report::{IndexCounts, IndexIssue, IndexReport, IndexStatus, PublicationStatus};
+use crate::progress::{IndexEvent, ProgressEvent};
 
-#[derive(Clone, Copy, Default)]
-struct Counts {
-    indexed: usize,
-    reused: usize,
-    unchanged: usize,
+/// Console presentation for synchronous indexing and snapshot events.
+#[derive(Default)]
+pub(crate) struct Reporter {
+    root: Option<PathBuf>,
+    spinner: Option<ProgressBar>,
 }
 
-impl Counts {
-    fn record(&mut self, status: &IndexStatus) {
-        match status {
-            IndexStatus::Indexed => self.indexed += 1,
-            IndexStatus::Reused => self.reused += 1,
-            IndexStatus::Unchanged => self.unchanged += 1,
+impl Reporter {
+    /// Display `event` with console formatting and a live spinner where available.
+    pub(crate) fn handle(&mut self, event: ProgressEvent<'_>) {
+        match event {
+            ProgressEvent::Index {
+                event,
+                seen,
+                staged,
+                errors,
+            } => {
+                if let IndexEvent::Opening(root) = event {
+                    self.open_index(root);
+                }
+                self.refresh_counts(seen, staged, errors);
+                match event {
+                    IndexEvent::Opening(root) => {
+                        self.stage(format_args!("Opening index for {}", path_label(root)))
+                    }
+                    IndexEvent::Scanning => self.stage("Scanning Markdown"),
+                    IndexEvent::File(path) => self.file(path),
+                    IndexEvent::Embedding { path, chunk } => self.embedding(path, chunk),
+                    IndexEvent::Staged { path, status } => self.staged(path, status),
+                    IndexEvent::CheckingDeletions => self.stage("Checking for deleted files"),
+                    IndexEvent::Removal(path) => self.removal(path),
+                    IndexEvent::Compacting => self.stage("Compacting vector index"),
+                    IndexEvent::Issue(issue) => self.issue(issue),
+                }
+            }
+            // Standalone compaction prints its summary and warnings only.
+            ProgressEvent::SavingSnapshot if self.root.is_some() => {
+                self.stage("Saving USearch snapshot")
+            }
+            ProgressEvent::Committing if self.root.is_some() => self.stage("Committing SQLite"),
+            ProgressEvent::SavingSnapshot | ProgressEvent::Committing => {}
+            ProgressEvent::SnapshotCleanupFailed { path, error } => self.error(format_args!(
+                "Could not clean up index snapshot {}: {error}",
+                path_label(path),
+            )),
         }
     }
-}
 
-pub(crate) enum Phase {
-    Scanning,
-    CheckingDeletions,
-    SavingSnapshot,
-    Committing,
-}
-
-pub(crate) struct Reporter<'a> {
-    root: &'a Path,
-    spinner: Option<ProgressBar>,
-    files_seen: Cell<usize>,
-    staged: Cell<Counts>,
-    completed: RefCell<HashMap<PathBuf, IndexStatus>>,
-    removed: Cell<usize>,
-    errors: Cell<usize>,
-}
-
-impl<'a> Reporter<'a> {
-    pub(crate) fn new(root: &'a Path) -> Self {
-        let spinner = if io::stdout().is_terminal() && io::stderr().is_terminal() {
+    /// Remember the canonical `root` and start the terminal display for indexing.
+    fn open_index(&mut self, root: &Path) {
+        self.root = Some(root.to_path_buf());
+        self.spinner = if io::stdout().is_terminal() && io::stderr().is_terminal() {
             let bar = ProgressBar::new_spinner().with_finish(ProgressFinish::AndClear);
             if bar.is_hidden() {
                 None
@@ -62,47 +77,27 @@ impl<'a> Reporter<'a> {
         } else {
             None
         };
-        let reporter = Self {
-            root,
-            spinner,
-            files_seen: Cell::new(0),
-            staged: Cell::new(Counts::default()),
-            completed: RefCell::new(HashMap::new()),
-            removed: Cell::new(0),
-            errors: Cell::new(0),
-        };
-        reporter.stage(format_args!("Opening index for {}", path_label(root)));
-        reporter
     }
 
-    pub(crate) fn phase(&self, phase: Phase) {
-        self.stage(match phase {
-            Phase::Scanning => "Scanning Markdown",
-            Phase::CheckingDeletions => "Checking for deleted files",
-            Phase::SavingSnapshot => "Saving USearch snapshot",
-            Phase::Committing => "Committing SQLite",
-        });
-    }
-
+    /// Display a progress `message` in the spinner or as a plain-text line.
     fn stage(&self, message: impl Display) {
         if let Some(spinner) = &self.spinner {
             spinner.set_message(message.to_string());
-            self.refresh_counts();
             spinner.force_draw();
         } else {
             log_line(message);
         }
     }
 
-    pub(crate) fn file(&self, path: &Path) {
-        self.files_seen.set(self.files_seen.get() + 1);
+    /// Display the source `path` currently being processed without changing pass statistics.
+    fn file(&self, path: &Path) {
         if let Some(spinner) = &self.spinner {
             spinner.set_message(format!("Reading {}", self.short_path_label(path)));
-            self.refresh_counts();
         }
     }
 
-    pub(crate) fn embedding(&self, path: &Path, chunk: usize) {
+    /// Display embedding generation for `chunk` of `path`.
+    fn embedding(&self, path: &Path, chunk: usize) {
         if let Some(spinner) = &self.spinner {
             spinner.set_message(format!(
                 "Embedding chunk {chunk} · {}",
@@ -113,22 +108,16 @@ impl<'a> Reporter<'a> {
         }
     }
 
-    pub(crate) fn removal(&self, path: &Path) {
-        // The file may have disappeared after it was staged in this run.
-        self.completed.borrow_mut().remove(path);
-        self.removed.set(self.removed.get() + 1);
+    /// Display the staged removal of `path`; indexing owns the removal count.
+    fn removal(&self, path: &Path) {
         if self.spinner.is_none() {
             log_line(format_args!("Removal ready: {}", path_label(path)));
         }
     }
 
-    pub(crate) fn staged(&self, path: &Path, status: IndexStatus) {
-        let mut counts = self.staged.get();
-        counts.record(&status);
-        self.staged.set(counts);
-        if self.spinner.is_some() {
-            self.refresh_counts();
-        } else {
+    /// Display the prepared `status` of source `path` using indexing-owned counters.
+    fn staged(&self, path: &Path, status: IndexStatus) {
+        if self.spinner.is_none() {
             let label = match status {
                 IndexStatus::Indexed => "Ready to save",
                 IndexStatus::Reused => "Reuse ready",
@@ -136,41 +125,16 @@ impl<'a> Reporter<'a> {
             };
             log_line(format_args!("{label}: {}", path_label(path)));
         }
-        self.completed
-            .borrow_mut()
-            .insert(path.to_path_buf(), status);
     }
 
-    pub(crate) fn file_error(&self, path: &Path, error: &dyn Display) {
-        self.error(format_args!("{}: {error}", path_label(path)));
-    }
-
-    pub(crate) fn indexing_aborted_at(&self, path: &Path, error: &dyn Display) {
-        self.error(format_args!(
-            "Indexing failed: {}: {error}",
-            path_label(path)
-        ));
-    }
-
-    pub(crate) fn deletion_check_error(&self, path: &Path, error: &io::Error) {
-        self.error(format_args!(
-            "Could not check {}: {error}",
-            path_label(path)
-        ));
-    }
-
-    pub(crate) fn snapshot_load_failed(&self, path: &Path, error: &dyn Display) {
-        self.error(format_args!(
-            "Indexing failed: Cannot load active index {}: {error}",
-            path_label(path)
-        ));
-    }
-
-    pub(crate) fn snapshot_cleanup_failed(path: &Path, error: &io::Error) {
-        eprintln!(
-            "Could not remove previous index {}: {error}",
-            path_label(path)
-        );
+    /// Display an indexing-owned `issue` without recording or counting it again.
+    fn issue(&self, issue: &IndexIssue) {
+        match &issue.path {
+            Some(path) if self.root.is_some() => {
+                self.error(format_args!("{}: {}", path_label(path), issue.message))
+            }
+            _ => self.error(format_args!("Indexing failed: {}", issue.message)),
+        }
     }
 
     pub(crate) fn indexing_failed(error: &dyn Display) {
@@ -185,44 +149,106 @@ impl<'a> Reporter<'a> {
         eprintln!("Failed to load config {}: {error}", path_label(path));
     }
 
-    pub(crate) fn ollama_init_failed(error: &dyn Display) {
-        eprintln!("Failed to initialize Ollama client: {error}");
+    /// Report the embedding component initialization failure described by `error`.
+    pub(crate) fn embedding_init_failed(error: &dyn Display) {
+        eprintln!("Failed to initialize embeddings: {error}");
     }
 
-    pub(crate) fn search_preview(query: &str, limit: usize) {
-        log_line(format_args!("Searching: {query}, limit: {limit}"));
+    pub(crate) fn searching_failed(error: &dyn Display) {
+        eprintln!("Search failed: {error}");
     }
 
+    /// Print committed compaction counts, or an empty-index message for `None`.
+    ///
+    /// `report` contains vector counts after successful publication.
+    /// Returns success after flushing stdout, or an error if writing fails.
+    pub(crate) fn compacted(report: Option<&CompactReport>) -> io::Result<()> {
+        let mut stdout = io::stdout().lock();
+        match report {
+            Some(report) => writeln!(
+                stdout,
+                "Compacted: {} → {} vectors · Removed: {}",
+                report.previous_vectors,
+                report.retained_vectors,
+                report.previous_vectors - report.retained_vectors,
+            )?,
+            None => writeln!(stdout, "No active vector index to compact.")?,
+        }
+        stdout.flush()
+    }
+
+    /// Report the compaction or output failure described by `error` to stderr.
+    pub(crate) fn compaction_failed(error: &dyn Display) {
+        eprintln!("Compaction failed: {error}");
+    }
+
+    /// Display diagnostic `message`, temporarily suspending the terminal spinner.
     fn error(&self, message: impl Display) {
-        self.errors.set(self.errors.get() + 1);
         if let Some(spinner) = &self.spinner {
-            self.refresh_counts();
             spinner.suspend(|| eprintln!("{message}"));
         } else {
             eprintln!("{message}");
         }
     }
 
-    pub(crate) fn committed(self) {
+    /// Clear the live display after the indexing pass finishes, without printing a summary.
+    pub(crate) fn finish(self) {
         if let Some(spinner) = &self.spinner {
             spinner.finish_and_clear();
         }
-        let mut counts = Counts::default();
-        for status in self.completed.into_inner().into_values() {
-            counts.record(&status);
+    }
+
+    /// Print publication status and counters from the completed indexing `report`.
+    ///
+    /// Prepared counts are shown separately when rollback prevented publication.
+    /// Returns success after flushing stdout, or an error if output fails.
+    pub(crate) fn indexed(report: &IndexReport) -> io::Result<()> {
+        let mut stdout = io::stdout().lock();
+        match report.publication {
+            PublicationStatus::Published {
+                snapshot_updated,
+                compacted,
+            } => writeln!(
+                stdout,
+                "Publication: published · Snapshot: {} · Compacted: {}",
+                if snapshot_updated {
+                    "updated"
+                } else {
+                    "unchanged"
+                },
+                if compacted { "yes" } else { "no" },
+            )?,
+            PublicationStatus::NotPublished => writeln!(stdout, "Publication: not published")?,
         }
-        log_line(format_args!(
-            "Indexed: {} · Reused: {} · Unchanged: {} · Removed: {} · Errors: {}",
+        let counts = report.committed;
+        writeln!(
+            stdout,
+            "Indexed: {} · Reused: {} · Unchanged: {} · Removed: {} · Errors: {} · Seen: {}",
             counts.indexed,
             counts.reused,
             counts.unchanged,
-            self.removed.get(),
-            self.errors.get()
-        ));
+            counts.removed,
+            report.errors.len(),
+            report.files_seen,
+        )?;
+        if report.staged != report.committed {
+            let staged = report.staged;
+            writeln!(
+                stdout,
+                "Prepared but not published: Indexed: {} · Reused: {} · Unchanged: {} · Removed: {}",
+                staged.indexed, staged.reused, staged.unchanged, staged.removed,
+            )?;
+        }
+        stdout.flush()
     }
 
+    /// Return a display label for `path` relative to the current indexing root where possible.
     fn short_path_label(&self, path: &Path) -> String {
-        let relative = path.strip_prefix(self.root).unwrap_or(path);
+        let relative = self
+            .root
+            .as_ref()
+            .and_then(|root| path.strip_prefix(root).ok())
+            .unwrap_or(path);
         let label = if relative.as_os_str().is_empty() {
             path.file_name().map(Path::new).unwrap_or(path)
         } else {
@@ -231,16 +257,12 @@ impl<'a> Reporter<'a> {
         path_label(label)
     }
 
-    fn refresh_counts(&self) {
+    /// Display the `seen` file count, `staged` counts, and `errors` in the spinner.
+    fn refresh_counts(&self, seen: usize, staged: IndexCounts, errors: usize) {
         if let Some(spinner) = &self.spinner {
-            let counts = self.staged.get();
             spinner.set_prefix(format!(
                 "Seen {}  Ready {}  Reuse ready {}  Unchanged {}  Errors {}",
-                self.files_seen.get(),
-                counts.indexed,
-                counts.reused,
-                counts.unchanged,
-                self.errors.get()
+                seen, staged.indexed, staged.reused, staged.unchanged, errors,
             ));
         }
     }
