@@ -1,6 +1,16 @@
-use super::*;
-use crate::adapter::{Attributes, Chunk, DocumentMetadata, SourceLocation};
-use crate::database::*;
+use std::io;
+use std::num::NonZeroUsize;
+use std::path::Path;
+
+use rusqlite::Connection;
+
+use super::{StageOutcome, allocate_vector_key, stage_document, stage_file};
+use crate::adapter::{Attributes, Chunk, Document, DocumentMetadata, SourceLocation};
+use crate::database::{self, *};
+use crate::embeddings::Embedder;
+use crate::index_report::IndexStatus;
+use crate::indexer::tests::test_embedder;
+use crate::snapshot;
 
 /// Validate `chunk_size` and save `path` with `hash` and lazy `load_document`.
 ///
@@ -324,5 +334,100 @@ fn removed_vectors_follow_chunk_lifetimes_and_rollbacks() -> Result<()> {
     expected.sort_unstable();
     assert_eq!(removed, expected);
     assert!(hashes(&connection)?.is_empty());
+    Ok(())
+}
+
+/// Verify colliding prefixes retain distinct full hashes and stable keys in SQLite.
+/// Returns success for both lookups, USearch key round trips, and sentinel
+/// handling, or a database or vector index error.
+#[test]
+fn conflicting_vector_keys_probe_without_aliasing_full_hashes() -> Result<()> {
+    let connection = database::open(Path::new(":memory:"))?;
+    let mut bytes = [0; 32];
+    bytes[..8].copy_from_slice(&(u64::MAX - 1).to_le_bytes());
+    let first = blake3::Hash::from_bytes(bytes);
+    bytes[8] = 1;
+    let second = blake3::Hash::from_bytes(bytes);
+    let first_key = allocate_vector_key(&connection, &first)?;
+    let second_key = allocate_vector_key(&connection, &second)?;
+    assert_eq!(first_key, u64::MAX - 1);
+    assert_eq!(second_key, 0);
+    let index = snapshot::new_index(NonZeroUsize::new(3).unwrap())?;
+    index.reserve(2)?;
+    index.add(first_key, &[1.0_f32, 0.0, 0.0])?;
+    index.add(second_key, &[0.0_f32, 1.0, 0.0])?;
+    let mut vector = [0.0_f32; 3];
+    assert_eq!(index.get(first_key, &mut vector)?, 1);
+    assert_eq!(vector, [1.0, 0.0, 0.0]);
+    assert_eq!(index.get(second_key, &mut vector)?, 1);
+    assert_eq!(vector, [0.0, 1.0, 0.0]);
+    assert_eq!(
+        database::embedding_key(&connection, &first)?,
+        Some(first_key)
+    );
+    assert_eq!(
+        database::embedding_key(&connection, &second)?,
+        Some(second_key)
+    );
+    database::delete_embedding(&connection, first_key)?;
+    assert_eq!(
+        database::embedding_key(&connection, &second)?,
+        Some(second_key)
+    );
+    Ok(())
+}
+
+/// Verify a file savepoint restores chunks and pending vectors together.
+///
+/// Returns success if the old vector remains staged and the failed file's
+/// vector and embedding metadata disappear. Propagates fixture or SQL errors.
+#[test]
+fn failed_file_rollback_restores_staged_vectors_and_chunks() -> Result<()> {
+    let mut connection = database::open(Path::new(":memory:"))?;
+    let mut transaction = connection.transaction()?;
+    database::track_removed_vectors(&transaction)?;
+    database::create_vector_staging(&transaction)?;
+    let embedder = test_embedder(None, None);
+    let settings = embedder.settings();
+    let chunk_size = NonZeroUsize::new(5).unwrap();
+    assert!(matches!(
+        stage_file(
+            &mut transaction,
+            Path::new("note.md"),
+            "old",
+            chunk_size,
+            settings,
+            |_, _| Ok(vec![1.0_f32, 0.0, 0.0]),
+        )?,
+        StageOutcome::Staged(IndexStatus::Indexed),
+    ));
+    let result = stage_file(
+        &mut transaction,
+        Path::new("note.md"),
+        "first\n\nsecond",
+        chunk_size,
+        settings,
+        |_, ordinal| {
+            if ordinal == 2 {
+                Err(io::Error::other("embedding failed").into())
+            } else {
+                Ok(vec![0.0_f32, 1.0, 0.0])
+            }
+        },
+    )?;
+    assert!(matches!(
+        result,
+        StageOutcome::RolledBack(error) if error.to_string().contains("embedding failed")
+    ));
+    assert_eq!(database::staged_vector_count(&transaction)?, 1);
+    let old_key = database::embedding_key(&transaction, &blake3::hash(b"old"))?.unwrap();
+    database::visit_staged_vectors(&transaction, settings.dimensions, |key, vector| {
+        assert_eq!(key, old_key);
+        assert_eq!(vector, &[1.0_f32, 0.0, 0.0]);
+        Ok(())
+    })?;
+    assert_eq!(database::chunk_sources(&transaction, old_key)?.len(), 1);
+    assert!(database::embedding_key(&transaction, &blake3::hash(b"first"))?.is_none());
+    assert!(database::removed_vector_keys(&transaction)?.is_empty());
     Ok(())
 }

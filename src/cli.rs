@@ -27,10 +27,6 @@ pub(crate) enum Commands {
         #[arg(long)]
         chunk_size: Option<NonZeroUsize>,
 
-        /// Glass mode: stop on the first traversal or processing error
-        #[arg(long)]
-        glass: bool,
-
         /// Defer automatic compaction while retaining accumulated removal counts
         #[arg(long)]
         no_compact: bool,

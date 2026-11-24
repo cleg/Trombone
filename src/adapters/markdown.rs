@@ -61,6 +61,7 @@ impl<'a> MarkdownChunks<'a> {
 impl Iterator for MarkdownChunks<'_> {
     type Item = Chunk;
 
+    /// Advances this iterator and returns the next Markdown chunk, or `None` at exhaustion.
     fn next(&mut self) -> Option<Self::Item> {
         if self.finished {
             return None;
@@ -121,10 +122,15 @@ impl Iterator for MarkdownChunks<'_> {
                         title.push(' ');
                     }
                 }
-                Event::Rule | Event::Html(_) if self.depth == 0 => {
-                    self.remaining = Some(range);
+                Event::Rule | Event::Html(_) => {
+                    if self.depth == 0 {
+                        self.remaining = Some(range);
+                    }
                 }
-                _ => {}
+                // The enclosing block's source range already includes these tokens.
+                Event::InlineHtml(_) | Event::TaskListMarker(_) => {}
+                // The parser options leave math and footnote extensions disabled.
+                Event::InlineMath(_) | Event::DisplayMath(_) | Event::FootnoteReference(_) => {}
             }
         }
     }

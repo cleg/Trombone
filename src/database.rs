@@ -169,40 +169,6 @@ pub(crate) fn delete_document(connection: &Connection, source: &str) -> Result<(
     Ok(())
 }
 
-/// Move stored `source` to its `canonical` identity in `connection`'s transaction.
-///
-/// Returns true if an alias row was removed because the canonical row already
-/// exists; otherwise renames the source without replacing its content. Chunk
-/// cleanup triggers preserve shared content and track obsolete vectors normally.
-///
-/// # Errors
-///
-/// Returns an error for non-UTF-8 paths or SQLite failures.
-pub(crate) fn relocate_document(
-    connection: &Connection,
-    source: &str,
-    canonical: &Path,
-) -> Result<bool> {
-    let canonical = canonical
-        .to_str()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Source path must be UTF-8"))?;
-    if source == canonical {
-        return Ok(false);
-    }
-    let removed = connection.execute(
-        "DELETE FROM documents WHERE source = ?1
-         AND EXISTS (SELECT 1 FROM documents WHERE source = ?2)",
-        params![source, canonical],
-    )?;
-    if removed == 0 {
-        connection.execute(
-            "UPDATE documents SET source = ?2 WHERE source = ?1",
-            params![source, canonical],
-        )?;
-    }
-    Ok(removed != 0)
-}
-
 /// Track deleted chunk keys for the current indexing connection.
 ///
 /// `connection` owns the indexing transaction. The temporary trigger records
@@ -222,6 +188,88 @@ pub(crate) fn track_removed_vectors(connection: &Connection) -> Result<()> {
              INSERT OR IGNORE INTO removed_vector_keys (vector_key) VALUES (OLD.vector_key);
          END;",
     )?;
+    Ok(())
+}
+
+/// Create the staging table on the indexing `connection`.
+///
+/// Returns success once new vectors can be staged under the file savepoints,
+/// or an error if SQLite cannot create the temporary table.
+pub(crate) fn create_vector_staging(connection: &Connection) -> Result<()> {
+    connection.execute_batch(
+        "CREATE TEMP TABLE staged_vectors (
+             id INTEGER PRIMARY KEY,
+             vector_key INTEGER NOT NULL UNIQUE,
+             data BLOB NOT NULL
+         );",
+    )?;
+    Ok(())
+}
+
+/// Stage the `vector` for `key` inside the file savepoint on `connection`.
+///
+/// Returns success after writing the vector as little-endian floats, or an error
+/// if SQLite cannot insert it. The caller validates the vector dimensions.
+pub(crate) fn stage_vector(connection: &Connection, key: u64, vector: &[f32]) -> Result<()> {
+    let data: Vec<u8> = vector
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect();
+    connection
+        .prepare_cached("INSERT INTO temp.staged_vectors (vector_key, data) VALUES (?1, ?2)")?
+        .execute(params![key.cast_signed(), data])?;
+    Ok(())
+}
+
+/// Remove `key` from staging on `connection` before deleting its embedding metadata.
+///
+/// Returns true if the vector existed only in staging, false if it must be
+/// removed from the published graph, or an error if the SQLite delete fails.
+pub(crate) fn discard_staged_vector(connection: &Connection, key: u64) -> Result<bool> {
+    Ok(connection
+        .prepare_cached("DELETE FROM temp.staged_vectors WHERE vector_key = ?1")?
+        .execute([key.cast_signed()])?
+        == 1)
+}
+
+/// Count the vectors staged on `connection` for the current indexing pass.
+///
+/// Returns the count or an error if SQLite cannot read it or it exceeds `usize`.
+pub(crate) fn staged_vector_count(connection: &Connection) -> Result<usize> {
+    let count: i64 =
+        connection.query_row("SELECT COUNT(*) FROM temp.staged_vectors", [], |row| {
+            row.get(0)
+        })?;
+    Ok(usize::try_from(count)?)
+}
+
+/// Decode staged vectors on `connection` and pass each key and vector to `visit`.
+///
+/// `dimensions` is the expected number of floats per vector. Visits vectors in
+/// insertion order, borrowing one reusable buffer. Returns success after all
+/// visits, or an error for invalid data, failed SQLite reads, or a failed visit.
+pub(crate) fn visit_staged_vectors(
+    connection: &Connection,
+    dimensions: NonZeroUsize,
+    mut visit: impl FnMut(u64, &[f32]) -> Result<()>,
+) -> Result<()> {
+    let mut statement =
+        connection.prepare("SELECT vector_key, data FROM temp.staged_vectors ORDER BY id")?;
+    let mut rows = statement.query([])?;
+    let mut vector = Vec::new();
+    while let Some(row) = rows.next()? {
+        let key = row.get::<_, i64>(0)?.cast_unsigned();
+        let data = row.get_ref(1)?.as_blob()?;
+        let (values, remainder) = data.as_chunks::<4>();
+        if !remainder.is_empty() || values.len() != dimensions.get() {
+            return Err(
+                io::Error::other(format!("Invalid staged vector data for key {key}")).into(),
+            );
+        }
+        vector.clear();
+        vector.extend(values.iter().copied().map(f32::from_le_bytes));
+        visit(key, &vector)?;
+    }
     Ok(())
 }
 

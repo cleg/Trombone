@@ -32,7 +32,8 @@ use search_output::{ConsoleOutput, JsonOutput, SearchOutput};
 /// Returns success after a complete operation, or failure after reporting a
 /// configuration, indexing, compaction, search, or output error. Indexing forwards
 /// its automatic-compaction preference and derives the exit code from IndexReport.
-/// Indexing initializes its embedding client after acquiring the writer lock.
+/// The report can include published work alongside recoverable errors.
+/// Indexing and search initialize the embedding client before entering their core operations.
 /// Progress events are rendered by the console reporter here.
 fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -66,25 +67,18 @@ fn main() -> ExitCode {
         Commands::Index {
             path,
             chunk_size,
-            glass,
             no_compact,
         } => {
+            let embedder = match initialize_embedder(&config) {
+                Ok(embedder) => embedder,
+                Err(status) => return status,
+            };
             let report = indexer::run(
                 &path,
                 chunk_size.unwrap_or(config.chunking.size),
-                glass,
                 no_compact,
                 &config.database,
-                || {
-                    OllamaEmbedder::new(&config.ollama)
-                        .map(Box::new)
-                        .map_err(|error| {
-                            std::io::Error::other(format!(
-                                "Failed to initialize embeddings: {error}"
-                            ))
-                            .into()
-                        })
-                },
+                &embedder,
                 &mut |event| reporter.handle(event),
             );
             reporter.finish();

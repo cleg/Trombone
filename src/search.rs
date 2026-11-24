@@ -310,6 +310,7 @@ mod tests {
 
     /// Verify search starts at the requested count, expands past stale notes,
     /// and stops at the candidate budget even if a valid note lies beyond it.
+    /// Indexing and search borrow the same ranking fixture.
     /// Returns success for all three outcomes or propagates fixture and search errors.
     #[test]
     fn search_expands_only_as_needed_within_candidate_budget() -> Result<()> {
@@ -335,9 +336,8 @@ mod tests {
             directory.path(),
             NonZeroUsize::new(1_000).unwrap(),
             false,
-            false,
             &database,
-            || Ok(&embedder),
+            &embedder,
             &mut |_| {},
         );
         assert!(report.is_success(), "{:?}", report.errors);

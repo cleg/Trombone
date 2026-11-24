@@ -487,8 +487,9 @@ mod tests {
 
     /// Verify typed excerpts, report success, and name/digest compatibility through the API.
     ///
-    /// Returns success when a service-free embedder supports the real storage
-    /// pipeline; propagates filesystem, SQLite, index, and search errors.
+    /// Returns success when both operations can borrow the same service-free
+    /// embedder in the real storage pipeline. Propagates filesystem, SQLite,
+    /// index, and search errors.
     #[test]
     fn indexing_and_search_depend_only_on_the_embedding_boundary() -> Result<()> {
         let directory = tempfile::tempdir()?;
@@ -510,32 +511,14 @@ mod tests {
         };
         let chunk_size = NonZeroUsize::new(1_000).unwrap();
         assert!(
-            indexer::run(
-                &note,
-                chunk_size,
-                false,
-                false,
-                &database,
-                || Ok(&embedder),
-                &mut |_| {}
-            )
-            .is_success()
+            indexer::run(&note, chunk_size, false, &database, &embedder, &mut |_| {}).is_success()
         );
         assert_eq!(
             *embedder.chunks.borrow(),
             [format!("title: Корінь 🙂 | text: {body}")]
         );
         assert!(
-            indexer::run(
-                &note,
-                chunk_size,
-                false,
-                false,
-                &database,
-                || Ok(&embedder),
-                &mut |_| {}
-            )
-            .is_success()
+            indexer::run(&note, chunk_size, false, &database, &embedder, &mut |_| {}).is_success()
         );
         assert_eq!(embedder.chunks.borrow().len(), 1);
 
@@ -560,15 +543,7 @@ mod tests {
             &note,
             "New content that must not be embedded with the replacement model.",
         )?;
-        let report = indexer::run(
-            &note,
-            chunk_size,
-            false,
-            false,
-            &database,
-            || Ok(&embedder),
-            &mut |_| {},
-        );
+        let report = indexer::run(&note, chunk_size, false, &database, &embedder, &mut |_| {});
         assert!(!report.is_success());
         assert_eq!(
             report.publication,
@@ -589,16 +564,7 @@ mod tests {
         embedder.settings.model = "another-model".into();
         assert!(search::run("incompatible".into(), 5, &database, &embedder).is_err());
         assert!(
-            !indexer::run(
-                &note,
-                chunk_size,
-                false,
-                false,
-                &database,
-                || Ok(&embedder),
-                &mut |_| {}
-            )
-            .is_success()
+            !indexer::run(&note, chunk_size, false, &database, &embedder, &mut |_| {}).is_success()
         );
         assert_eq!(embedder.chunks.borrow().len(), 1);
         assert_eq!(embedder.queries.borrow().len(), 1);
