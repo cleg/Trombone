@@ -1,18 +1,17 @@
 //! Indexes files in SQLite and maintains the corresponding USearch snapshot.
 //!
 //! Each pass stages document changes and new vectors in SQLite, then removes
-//! records for unavailable sources. When vectors change or automatic compaction
-//! is due, it saves one snapshot before committing the documents, counters, and
-//! snapshot reference together.
+//! records absent from a complete walk of the configured roots. When vectors
+//! change or automatic compaction is due, it saves one snapshot before committing
+//! the documents, counters, and snapshot reference together.
 
 mod document;
-mod paths;
 mod publication;
 
 use std::fs;
 use std::io;
 use std::num::NonZeroUsize;
-use std::path::Path;
+use std::path::PathBuf;
 
 use crate::config::DatabaseConfig;
 use crate::database::{self, Result};
@@ -20,18 +19,16 @@ use crate::embeddings::Embedder;
 use crate::index_report::{IndexProgress, IndexReport, PublicationStatus};
 use crate::progress::{IndexEvent, ProgressEvent};
 use crate::snapshot;
-use crate::walker::{WalkOutcome, Walker};
+use crate::walker::{self, WalkOutcome};
 
 use self::document::process_file;
-use self::paths::remove_missing_documents;
 use self::publication::publish_index;
 
-/// Index the files under `root` and remove unavailable sources in that scope.
+/// Index the files reachable from `roots` and reconcile the entire database.
 ///
 /// # Parameters
 ///
-/// - `root` is the existing file or directory to index; symlinks resolve to its
-///   canonical absolute identity before opening storage.
+/// - `roots` is the validated list of configured source directories.
 /// - `chunk_size` is the maximum chunk length in Unicode characters.
 /// - `no_compact` defers automatic rebuilding while preserving removal history.
 /// - `database` provides the SQLite and snapshot location.
@@ -43,7 +40,7 @@ use self::publication::publish_index;
 /// keep their staged counts, report zero committed counts, and retain their
 /// diagnostics without requiring callers to interpret nested results.
 pub(crate) fn run(
-    root: &Path,
+    roots: &[PathBuf],
     chunk_size: NonZeroUsize,
     no_compact: bool,
     database: &DatabaseConfig,
@@ -51,15 +48,12 @@ pub(crate) fn run(
     emit: &mut dyn FnMut(ProgressEvent<'_>),
 ) -> IndexReport {
     let progress = IndexProgress::new(emit);
-    let root = match fs::canonicalize(root) {
-        Ok(root) => root,
-        Err(error) => {
-            progress.issue(Some(root), &error);
-            return progress.finish(PublicationStatus::NotPublished);
-        }
-    };
-    progress.notify(IndexEvent::Opening(&root));
-    let publication = match execute(&root, chunk_size, no_compact, database, embedder, &progress) {
+    if roots.is_empty() {
+        progress.issue(None, &"At least one source directory is required");
+        return progress.finish(PublicationStatus::NotPublished);
+    }
+    progress.notify(IndexEvent::Opening(&database.path));
+    let publication = match execute(roots, chunk_size, no_compact, database, embedder, &progress) {
         Ok(publication) => publication,
         Err(error) => {
             progress.issue(None, error.as_ref());
@@ -71,12 +65,13 @@ pub(crate) fn run(
 
 /// Coordinate preparation, traversal, deletion reconciliation, and publication.
 ///
-/// `root` defines the input scope, `chunk_size` limits chunk length in Unicode
-/// characters, and `no_compact` defers automatic compaction. `database` locates
-/// storage, `embedder` supplies model settings and chunk embeddings, and
-/// `progress` records counters and emits events.
+/// `roots` defines the desired documents for the database. `chunk_size` limits
+/// chunk length in Unicode characters and `no_compact` defers automatic compaction.
+/// `database` locates storage, `embedder` supplies model settings and chunk
+/// embeddings, and `progress` records counters and emits events.
 /// Returns the publication outcome. Recoverable errors allow traversal to
-/// continue; already-reported fatal errors return NotPublished.
+/// continue. An unopened set of roots or a reported snapshot failure returns
+/// NotPublished.
 /// Validates the pass's chunk size before loading vectors or visiting sources.
 /// Checks the active snapshot path during setup and loads its graph only when
 /// publication needs a replacement.
@@ -86,7 +81,7 @@ pub(crate) fn run(
 /// Returns unreported setup, database, vector cleanup, rebuild, and publication
 /// errors for the outer entry point to add to the report.
 fn execute(
-    root: &Path,
+    roots: &[PathBuf],
     chunk_size: NonZeroUsize,
     no_compact: bool,
     database: &DatabaseConfig,
@@ -118,18 +113,33 @@ fn execute(
     }
     database::track_removed_vectors(&transaction)?;
     database::create_vector_staging(&transaction)?;
-    progress.notify(IndexEvent::Scanning);
-    let walked = Walker {
-        report_error: &|path, error| progress.issue(Some(path), error),
+    database::create_source_tracking(&transaction)?;
+    let mut any_opened = false;
+    let mut complete = true;
+    for root in roots {
+        progress.notify(IndexEvent::Scanning(root));
+        let walked = walker::walk(
+            root,
+            |path| {
+                if database::mark_source_seen(&transaction, path)? {
+                    process_file(path, &mut transaction, chunk_size, embedder, progress)?;
+                }
+                Ok(())
+            },
+            |path, error| {
+                progress.defer_deletions();
+                progress.issue(Some(path), error);
+            },
+        )?;
+        any_opened |= !matches!(walked, WalkOutcome::Unopened);
+        complete &= matches!(walked, WalkOutcome::Complete);
     }
-    .walk(root, |path| {
-        process_file(path, &mut transaction, chunk_size, embedder, progress)
-    });
-    match walked {
-        Ok(WalkOutcome::Completed(input_kind)) => {
-            remove_missing_documents(&transaction, root, input_kind, progress)?;
-        }
-        Ok(WalkOutcome::StoppedByProcessor) | Err(_) => return Ok(PublicationStatus::NotPublished),
+    if !any_opened {
+        return Ok(PublicationStatus::NotPublished);
+    }
+    if complete {
+        progress.notify(IndexEvent::CheckingDeletions);
+        database::delete_unseen_documents(&transaction, |path| progress.removal(path))?;
     }
     publish_index(
         transaction,

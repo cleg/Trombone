@@ -21,6 +21,8 @@ pub(crate) fn default_path() -> io::Result<PathBuf> {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Config {
+    #[serde(default)]
+    roots: Vec<PathBuf>,
     pub(crate) ollama: OllamaConfig,
     pub(crate) database: DatabaseConfig,
     #[serde(default)]
@@ -88,23 +90,32 @@ fn default_request_timeout_secs() -> NonZeroU64 {
 impl Config {
     /// Load the TOML configuration at `path` and validate its templates and storage directory.
     ///
-    /// Returns the configuration with relative database paths resolved against
+    /// Returns the configuration with relative database and source paths resolved against
     /// the real config file location after following symlinks.
     ///
     /// # Errors
     ///
     /// Returns an error for unreadable or invalid TOML, invalid embedding input
-    /// templates, or an inaccessible or non-directory database location.
+    /// templates, a config location that cannot be resolved, or an inaccessible
+    /// or non-directory database location.
     pub(crate) fn load(path: &Path) -> Result<Self, Box<dyn Error>> {
         let text = fs::read_to_string(path)?;
         let mut config: Self = toml::from_str(&text)?;
         embeddings::validate_formats(&config.ollama)?;
-        if config.database.path.is_relative() {
+        if config.database.path.is_relative() || config.roots.iter().any(|root| root.is_relative())
+        {
             let config_path = fs::canonicalize(path)?;
             let directory = config_path.parent().ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidInput, "Config path has no parent")
             })?;
-            config.database.path = directory.join(&config.database.path);
+            if config.database.path.is_relative() {
+                config.database.path = directory.join(&config.database.path);
+            }
+            for root in &mut config.roots {
+                if !root.as_os_str().is_empty() && root.is_relative() {
+                    *root = directory.join(&*root);
+                }
+            }
         }
         let directory = &config.database.path;
         let metadata = fs::metadata(directory).map_err(|error| {
@@ -127,5 +138,51 @@ impl Config {
             .into());
         }
         Ok(config)
+    }
+
+    /// Return the configured roots for indexing without checking their availability.
+    ///
+    /// Returns a configuration error if the list or any of its paths is empty.
+    pub(crate) fn index_roots(&self) -> io::Result<&[PathBuf]> {
+        if self.roots.is_empty() || self.roots.iter().any(|root| root.as_os_str().is_empty()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "roots must contain at least one directory path and no empty paths",
+            ));
+        }
+        Ok(&self.roots)
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    /// Verify relative roots and database paths are anchored to the real TOML.
+    ///
+    /// Returns success for the resolved paths, including an unavailable root,
+    /// or propagates fixture and configuration errors.
+    #[test]
+    fn relative_paths_follow_the_real_config_location() -> Result<(), Box<dyn Error>> {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir()?;
+        let real = fs::canonicalize(directory.path())?.join("config");
+        fs::create_dir(&real)?;
+        let config_path = real.join("trombone.toml");
+        let alias = directory.path().join("linked.toml");
+        fs::write(
+            &config_path,
+            "roots = ['unavailable', '/absolute']\n[database]\npath = '.'\n[ollama]\nmodel = 'test'",
+        )?;
+        symlink(&config_path, &alias)?;
+
+        let config = Config::load(&alias)?;
+        assert_eq!(config.database.path, real);
+        assert_eq!(
+            config.index_roots()?,
+            [real.join("unavailable"), PathBuf::from("/absolute")]
+        );
+        Ok(())
     }
 }

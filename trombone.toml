@@ -1,3 +1,8 @@
+# Source directories for tb index. Relative paths start at the real config file.
+roots = [
+    "/Users/cleg/Library/Mobile Documents/iCloud~md~obsidian/Documents/MyVault"
+]
+
 [ollama]
 url = "http://localhost:11434"
 model = "embeddinggemma-2:740m-bf16"

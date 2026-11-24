@@ -14,7 +14,6 @@ mod reporter;
 mod search;
 mod search_output;
 mod snapshot;
-mod source_path;
 mod template;
 mod walker;
 
@@ -32,7 +31,8 @@ use search_output::{ConsoleOutput, JsonOutput, SearchOutput};
 /// Returns success after a complete operation, or failure after reporting a
 /// configuration, indexing, compaction, search, or output error. Indexing forwards
 /// its automatic-compaction preference and derives the exit code from IndexReport.
-/// The report can include published work alongside recoverable errors.
+/// The report can include published work alongside recoverable errors. Indexing
+/// validates its root list before initializing embeddings or opening storage.
 /// Indexing and search initialize the embedding client before entering their core operations.
 /// Progress events are rendered by the console reporter here.
 fn main() -> ExitCode {
@@ -65,16 +65,22 @@ fn main() -> ExitCode {
             }
         }
         Commands::Index {
-            path,
             chunk_size,
             no_compact,
         } => {
+            let roots = match config.index_roots() {
+                Ok(roots) => roots,
+                Err(error) => {
+                    Reporter::config_load_failed(&config_path, &error);
+                    return ExitCode::FAILURE;
+                }
+            };
             let embedder = match initialize_embedder(&config) {
                 Ok(embedder) => embedder,
                 Err(status) => return status,
             };
             let report = indexer::run(
-                &path,
+                roots,
                 chunk_size.unwrap_or(config.chunking.size),
                 no_compact,
                 &config.database,

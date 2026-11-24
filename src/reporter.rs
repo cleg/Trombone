@@ -12,6 +12,7 @@ use crate::progress::{IndexEvent, ProgressEvent};
 /// Console presentation for synchronous indexing and snapshot events.
 #[derive(Default)]
 pub(crate) struct Reporter {
+    indexing: bool,
     root: Option<PathBuf>,
     spinner: Option<ProgressBar>,
 }
@@ -26,15 +27,18 @@ impl Reporter {
                 staged,
                 errors,
             } => {
-                if let IndexEvent::Opening(root) = event {
-                    self.open_index(root);
+                if matches!(event, IndexEvent::Opening(_)) {
+                    self.open_index();
                 }
                 self.refresh_counts(seen, staged, errors);
                 match event {
-                    IndexEvent::Opening(root) => {
-                        self.stage(format_args!("Opening index for {}", path_label(root)))
+                    IndexEvent::Opening(database) => {
+                        self.stage(format_args!("Opening index in {}", path_label(database)))
                     }
-                    IndexEvent::Scanning => self.stage("Scanning Markdown"),
+                    IndexEvent::Scanning(root) => {
+                        self.root = Some(root.to_path_buf());
+                        self.stage(format_args!("Scanning Markdown in {}", path_label(root)));
+                    }
                     IndexEvent::File(path) => self.file(path),
                     IndexEvent::Embedding { path, chunk } => self.embedding(path, chunk),
                     IndexEvent::Staged { path, status } => self.staged(path, status),
@@ -45,10 +49,8 @@ impl Reporter {
                 }
             }
             // Standalone compaction prints its summary and warnings only.
-            ProgressEvent::SavingSnapshot if self.root.is_some() => {
-                self.stage("Saving USearch snapshot")
-            }
-            ProgressEvent::Committing if self.root.is_some() => self.stage("Committing SQLite"),
+            ProgressEvent::SavingSnapshot if self.indexing => self.stage("Saving USearch snapshot"),
+            ProgressEvent::Committing if self.indexing => self.stage("Committing SQLite"),
             ProgressEvent::SavingSnapshot | ProgressEvent::Committing => {}
             ProgressEvent::SnapshotCleanupFailed { path, error } => self.error(format_args!(
                 "Could not clean up index snapshot {}: {error}",
@@ -57,9 +59,9 @@ impl Reporter {
         }
     }
 
-    /// Remember the canonical `root` and start the terminal display for indexing.
-    fn open_index(&mut self, root: &Path) {
-        self.root = Some(root.to_path_buf());
+    /// Mark the reporter as indexing and start its terminal display.
+    fn open_index(&mut self) {
+        self.indexing = true;
         self.spinner = if io::stdout().is_terminal() && io::stderr().is_terminal() {
             let bar = ProgressBar::new_spinner().with_finish(ProgressFinish::AndClear);
             if bar.is_hidden() {
@@ -130,7 +132,7 @@ impl Reporter {
     /// Display an indexing-owned `issue` without recording or counting it again.
     fn issue(&self, issue: &IndexIssue) {
         match &issue.path {
-            Some(path) if self.root.is_some() => {
+            Some(path) if self.indexing => {
                 self.error(format_args!("{}: {}", path_label(path), issue.message))
             }
             _ => self.error(format_args!("Indexing failed: {}", issue.message)),
@@ -200,7 +202,7 @@ impl Reporter {
 
     /// Print publication status and counters from the completed indexing `report`.
     ///
-    /// Prepared counts are shown separately when rollback prevented publication.
+    /// Reports deferred deletion and includes prepared counts if publication failed.
     /// Returns success after flushing stdout, or an error if output fails.
     pub(crate) fn indexed(report: &IndexReport) -> io::Result<()> {
         let mut stdout = io::stdout().lock();
@@ -219,6 +221,12 @@ impl Reporter {
                 if compacted { "yes" } else { "no" },
             )?,
             PublicationStatus::NotPublished => writeln!(stdout, "Publication: not published")?,
+        }
+        if report.deletions_deferred {
+            writeln!(
+                stdout,
+                "Global deletion deferred because source traversal was incomplete."
+            )?;
         }
         let counts = report.committed;
         writeln!(

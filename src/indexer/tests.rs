@@ -87,8 +87,19 @@ pub(super) fn corpus() -> Result<(tempfile::TempDir, DatabaseConfig)> {
 ///
 /// Returns the complete report with default test chunk size and automatic compaction.
 fn index(root: &Path, database: &DatabaseConfig, embedder: &TestEmbedder) -> IndexReport {
+    index_roots(&[root.to_path_buf()], database, embedder)
+}
+
+/// Index the configured `roots` using `database` and the borrowed `embedder`.
+///
+/// Returns the complete report with default test chunk size and automatic compaction.
+fn index_roots(
+    roots: &[PathBuf],
+    database: &DatabaseConfig,
+    embedder: &TestEmbedder,
+) -> IndexReport {
     run(
-        root,
+        roots,
         NonZeroUsize::new(1_000).unwrap(),
         false,
         database,
@@ -109,11 +120,11 @@ fn one_writer_per_database_allows_parallel_search() -> Result<()> {
     let text = "Published content.";
     fs::write(&note, text)?;
     let embedder = test_embedder(None, None);
-    assert!(index(&note, &database, &embedder).is_success());
+    assert!(index(directory.path(), &database, &embedder).is_success());
 
     let mut checked_contention = false;
     let report = run(
-        &note,
+        &[directory.path().to_path_buf()],
         NonZeroUsize::new(1_000).unwrap(),
         false,
         &database,
@@ -122,7 +133,7 @@ fn one_writer_per_database_allows_parallel_search() -> Result<()> {
             if !matches!(
                 event,
                 ProgressEvent::Index {
-                    event: IndexEvent::Scanning,
+                    event: IndexEvent::Scanning(_),
                     ..
                 }
             ) {
@@ -131,7 +142,7 @@ fn one_writer_per_database_allows_parallel_search() -> Result<()> {
             checked_contention = true;
             let calls = embedder.calls.get();
             let competing = run(
-                &note,
+                &[directory.path().to_path_buf()],
                 NonZeroUsize::new(1_000).unwrap(),
                 false,
                 &database,
@@ -184,7 +195,7 @@ fn prepared_input_hash_reuses_vectors_across_edits_and_files() -> Result<()> {
     let shared_hash = blake3::hash(b"Common\n\nShared paragraph.\n");
     let embedder = test_embedder(None, None);
     fs::write(&a, "# Common\n\nShared paragraph.\n")?;
-    assert!(index(&a, &database, &embedder).is_success());
+    assert!(index(directory.path(), &database, &embedder).is_success());
     let reader = database::open_read_only(&database.sqlite_path())?;
     let key = database::embedding_key(&reader, &shared_hash)?.unwrap();
     let original = database::vector_index(&reader)?.unwrap().file_name;
@@ -192,7 +203,7 @@ fn prepared_input_hash_reuses_vectors_across_edits_and_files() -> Result<()> {
 
     // Moving the same excerpt down a line changes coordinates, but not model input.
     fs::write(&a, "\n# Common\n\nShared paragraph.\n")?;
-    let report = index(&a, &database, &embedder);
+    let report = index(directory.path(), &database, &embedder);
     assert!(report.is_success());
     assert_eq!(embedder.calls.get(), 1);
     assert_eq!(
@@ -208,7 +219,7 @@ fn prepared_input_hash_reuses_vectors_across_edits_and_files() -> Result<()> {
         &b,
         "# Common\n\nShared paragraph.\n\n# Other\n\nA second paragraph.\n",
     )?;
-    assert!(index(&b, &database, &embedder).is_success());
+    assert!(index(directory.path(), &database, &embedder).is_success());
     assert_eq!(embedder.calls.get(), 2);
     assert_eq!(database::chunk_sources(&reader, key)?.len(), 2);
     assert_eq!(database::live_vector_count(&reader)?, 2);
@@ -229,7 +240,7 @@ fn prepared_input_hash_reuses_vectors_across_edits_and_files() -> Result<()> {
 
     // Changing the heading changes the actual model input even with identical body text.
     fs::write(&b, "# Renamed\n\nShared paragraph.\n")?;
-    assert!(index(&b, &database, &embedder).is_success());
+    assert!(index(directory.path(), &database, &embedder).is_success());
     assert_eq!(embedder.calls.get(), 3);
     assert!(database::embedding_key(&reader, &shared_hash)?.is_none());
     let active = database::vector_index(&reader)?.unwrap();
@@ -253,11 +264,11 @@ fn chunk_size_mismatch_aborts_once_before_visiting_files() -> Result<()> {
     fs::write(&note, "A note.")?;
     fs::create_dir(&empty)?;
     let embedder = test_embedder(None, None);
-    assert!(index(&note, &database, &embedder).is_success());
+    assert!(index(directory.path(), &database, &embedder).is_success());
     let calls = embedder.calls.get();
     for root in [empty.as_path(), directory.path()] {
         let report = run(
-            root,
+            &[root.to_path_buf()],
             NonZeroUsize::new(500).unwrap(),
             false,
             &database,
@@ -352,14 +363,20 @@ fn report_distinguishes_new_reused_unchanged_and_removed_documents() -> Result<(
     Ok(())
 }
 
-/// Verify recoverable file failures publish good documents and count each issue once.
+/// Verify a failed read preserves the old row and permits other updates and deletions.
 ///
-/// Returns success on the partial report and stored documents; propagates fixture errors.
+/// Returns success for the report and stored documents, or a fixture/storage error.
 #[test]
 fn report_retains_errors_after_partial_publication() -> Result<()> {
     let (directory, database) = corpus()?;
     let good = directory.path().join("good.md");
     let bad = directory.path().join("bad.md");
+    let removed = directory.path().join("removed.md");
+    fs::write(&bad, "Previously readable.")?;
+    fs::write(&removed, "Previously present.")?;
+    assert!(index(directory.path(), &database, &test_embedder(None, None)).is_success());
+
+    fs::remove_file(&removed)?;
     fs::write(&good, "Valid body.")?;
     fs::write(&bad, [0xff])?;
     let report = index(directory.path(), &database, &test_embedder(None, None));
@@ -370,14 +387,22 @@ fn report_retains_errors_after_partial_publication() -> Result<()> {
     ));
     assert_eq!(report.files_seen, 2);
     assert_eq!(report.committed.indexed, 1);
+    assert_eq!(report.committed.removed, 1);
+    assert!(!report.deletions_deferred);
     assert_eq!(report.staged, report.committed);
     assert_eq!(report.errors.len(), 1);
     assert_eq!(report.errors[0].path.as_deref(), Some(bad.as_path()));
     let connection = database::open_read_only(&database.sqlite_path())?;
     assert_eq!(
         database::document_sources(&connection)?,
-        [good.to_str().unwrap()]
+        [bad.to_str().unwrap(), good.to_str().unwrap()]
     );
+    let hash = blake3::hash(b"Previously readable.").to_hex();
+    assert_eq!(
+        database::document_hash(&connection, bad.to_str().unwrap())?.as_deref(),
+        Some(hash.as_str())
+    );
+
     Ok(())
 }
 
@@ -438,20 +463,29 @@ fn embedding_failure_preserves_the_old_document_and_continues() -> Result<()> {
 
 /// Verify a publication failure after successful embedding reports an issue and zero committed work.
 ///
-/// Returns success on rollback and snapshot cleanup; propagates fixture errors.
+/// Returns success if both additions and deletions roll back and the previous
+/// snapshot stays active. Propagates fixture and storage errors.
 #[test]
 fn publication_failure_returns_an_unpublished_report() -> Result<()> {
     let (directory, database) = corpus()?;
-    fs::write(directory.path().join("note.md"), "A body.")?;
+    let old_root = directory.path().join("old");
+    let new_root = directory.path().join("new");
+    fs::create_dir(&old_root)?;
+    fs::create_dir(&new_root)?;
+    let old_note = old_root.join("note.md");
+    fs::write(&old_note, "Published content.")?;
+    let embedder = test_embedder(None, None);
+    assert!(index(&old_root, &database, &embedder).is_success());
+    fs::write(new_root.join("note.md"), "New content.")?;
     let connection = database::open(&database.sqlite_path())?;
+    let previous = database::vector_index(&connection)?.unwrap().file_name;
     connection.execute_batch(
         "CREATE TRIGGER fail_publication BEFORE INSERT ON vector_index
          BEGIN SELECT RAISE(ABORT, 'injected publication failure'); END;",
     )?;
-    let embedder = test_embedder(None, None);
     let mut events = Vec::new();
     let report = run(
-        directory.path(),
+        &[new_root],
         NonZeroUsize::new(1_000).unwrap(),
         false,
         &database,
@@ -485,6 +519,7 @@ fn publication_failure_returns_an_unpublished_report() -> Result<()> {
     assert_eq!(report.publication, PublicationStatus::NotPublished);
     assert!(!report.is_success());
     assert_eq!(report.staged.indexed, 1);
+    assert_eq!(report.staged.removed, 1);
     assert_eq!(report.committed, IndexCounts::default());
     assert_eq!(report.errors.len(), 1);
     assert!(
@@ -492,51 +527,55 @@ fn publication_failure_returns_an_unpublished_report() -> Result<()> {
             .message
             .contains("injected publication failure")
     );
-    assert!(database::document_sources(&connection)?.is_empty());
-    assert!(database::vector_index(&connection)?.is_none());
-    assert!(!fs::read_dir(directory.path())?.any(|entry| {
-        entry
-            .unwrap()
-            .path()
-            .extension()
-            .is_some_and(|extension| extension == "usearch")
-    }));
+    assert_eq!(
+        database::document_sources(&connection)?,
+        [old_note.to_str().unwrap()]
+    );
+    assert_eq!(
+        database::vector_index(&connection)?.unwrap().file_name,
+        previous
+    );
+    let snapshots = fs::read_dir(directory.path())?
+        .collect::<std::io::Result<Vec<_>>>()?
+        .into_iter()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "usearch")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(snapshots, [database.path.join(previous)]);
     Ok(())
 }
 
-/// Verify vanished prepared files contribute only to removal counts after publication.
+/// Verify a file that vanishes after discovery remains indexed for that pass.
 ///
-/// Returns success for reconciled counts; propagates fixture errors.
+/// Returns success if the next complete pass deletes it; propagates fixture and
+/// storage errors.
 #[test]
-fn vanished_prepared_file_is_not_counted_as_indexed() -> Result<()> {
+fn a_file_remains_seen_until_the_next_pass() -> Result<()> {
     let (directory, database) = corpus()?;
     let note = directory.path().join("vanishing.md");
     fs::write(&note, "A vanishing body.")?;
     let report = index(
         directory.path(),
         &database,
-        &test_embedder(None, Some(note)),
+        &test_embedder(None, Some(note.clone())),
     );
     assert!(report.is_success());
     assert_eq!(report.files_seen, 1);
-    assert_eq!(
-        report.committed,
-        IndexCounts {
-            removed: 1,
-            ..IndexCounts::default()
-        }
-    );
-    assert_eq!(report.staged, report.committed);
-    assert_eq!(
-        report.publication,
-        PublicationStatus::Published {
-            snapshot_updated: false,
-            compacted: false,
-        }
-    );
+    assert_eq!(report.committed.indexed, 1);
+    assert_eq!(report.committed.removed, 0);
     let connection = database::open_read_only(&database.sqlite_path())?;
-    assert!(database::vector_index(&connection)?.is_none());
-    assert!(database::embedding_key(&connection, &blake3::hash(b"A vanishing body."))?.is_none());
+    assert_eq!(
+        database::document_sources(&connection)?,
+        [note.to_str().unwrap()]
+    );
+
+    let report = index(directory.path(), &database, &test_embedder(None, None));
+    assert!(report.is_success());
+    assert_eq!(report.committed.removed, 1);
+    assert!(database::document_sources(&connection)?.is_empty());
     Ok(())
 }
 
@@ -555,16 +594,67 @@ fn traversal_and_snapshot_failures_return_reports_without_duplicate_errors() -> 
     assert_eq!(report.files_seen, 0);
     let note = directory.path().join("note.md");
     fs::write(&note, "A body.")?;
-    assert!(index(&note, &database, &embedder).is_success());
+    assert!(index(directory.path(), &database, &embedder).is_success());
     let connection = database::open_read_only(&database.sqlite_path())?;
     let active = database::vector_index(&connection)?.unwrap();
     let snapshot = database.path.join(&active.file_name);
     fs::remove_file(&snapshot)?;
-    let report = index(&note, &database, &embedder);
+    let report = index(directory.path(), &database, &embedder);
     assert_eq!(report.publication, PublicationStatus::NotPublished);
     assert_eq!(report.errors.len(), 1);
     assert_eq!(report.errors[0].path.as_deref(), Some(snapshot.as_path()));
     assert_eq!(report.staged, IndexCounts::default());
     assert_eq!(report.committed, IndexCounts::default());
+    Ok(())
+}
+
+/// Verify fatal SQLite errors roll back work already staged under another root.
+///
+/// Returns success when the previous rows and snapshot remain active, or a
+/// fixture/storage error.
+#[test]
+fn a_storage_failure_aborts_the_entire_pass() -> Result<()> {
+    let (directory, database) = corpus()?;
+    let first_root = directory.path().join("first");
+    let second_root = directory.path().join("second");
+    fs::create_dir(&first_root)?;
+    fs::create_dir(&second_root)?;
+    let first = first_root.join("old.md");
+    fs::write(&first, "Published first source.")?;
+    let embedder = test_embedder(None, None);
+    assert!(index(&first_root, &database, &embedder).is_success());
+
+    let connection = database::open(&database.sqlite_path())?;
+    let previous = database::vector_index(&connection)?.unwrap().file_name;
+    let old_hash = database::document_hash(&connection, first.to_str().unwrap())?;
+    connection.execute_batch(
+        "CREATE TRIGGER fail_document BEFORE INSERT ON documents WHEN substr(NEW.source, -6) = 'bad.md'
+         BEGIN SELECT RAISE(ABORT, 'injected document write failure'); END;",
+    )?;
+    fs::write(&first, "Edited first source.")?;
+    fs::write(second_root.join("bad.md"), "A later source.")?;
+
+    let report = index_roots(&[first_root, second_root], &database, &embedder);
+    assert_eq!(report.publication, PublicationStatus::NotPublished);
+    assert_eq!(report.staged.indexed, 1);
+    assert_eq!(report.committed, IndexCounts::default());
+    assert_eq!(report.errors.len(), 1);
+    assert!(
+        report.errors[0]
+            .message
+            .contains("injected document write failure")
+    );
+    assert_eq!(
+        database::document_sources(&connection)?,
+        [first.to_str().unwrap()]
+    );
+    assert_eq!(
+        database::document_hash(&connection, first.to_str().unwrap())?,
+        old_hash
+    );
+    assert_eq!(
+        database::vector_index(&connection)?.unwrap().file_name,
+        previous
+    );
     Ok(())
 }

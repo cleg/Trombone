@@ -509,16 +509,17 @@ mod tests {
             chunks: RefCell::new(Vec::new()),
             queries: RefCell::new(Vec::new()),
         };
+        let roots = [directory.path().to_path_buf()];
         let chunk_size = NonZeroUsize::new(1_000).unwrap();
         assert!(
-            indexer::run(&note, chunk_size, false, &database, &embedder, &mut |_| {}).is_success()
+            indexer::run(&roots, chunk_size, false, &database, &embedder, &mut |_| {}).is_success()
         );
         assert_eq!(
             *embedder.chunks.borrow(),
             [format!("title: Корінь 🙂 | text: {body}")]
         );
         assert!(
-            indexer::run(&note, chunk_size, false, &database, &embedder, &mut |_| {}).is_success()
+            indexer::run(&roots, chunk_size, false, &database, &embedder, &mut |_| {}).is_success()
         );
         assert_eq!(embedder.chunks.borrow().len(), 1);
 
@@ -543,7 +544,7 @@ mod tests {
             &note,
             "New content that must not be embedded with the replacement model.",
         )?;
-        let report = indexer::run(&note, chunk_size, false, &database, &embedder, &mut |_| {});
+        let report = indexer::run(&roots, chunk_size, false, &database, &embedder, &mut |_| {});
         assert!(!report.is_success());
         assert_eq!(
             report.publication,
@@ -564,7 +565,8 @@ mod tests {
         embedder.settings.model = "another-model".into();
         assert!(search::run("incompatible".into(), 5, &database, &embedder).is_err());
         assert!(
-            !indexer::run(&note, chunk_size, false, &database, &embedder, &mut |_| {}).is_success()
+            !indexer::run(&roots, chunk_size, false, &database, &embedder, &mut |_| {})
+                .is_success()
         );
         assert_eq!(embedder.chunks.borrow().len(), 1);
         assert_eq!(embedder.queries.borrow().len(), 1);

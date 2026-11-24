@@ -19,10 +19,8 @@ pub(crate) enum Commands {
     /// Rebuild the vector index from current chunks without regenerating embeddings
     Compact,
 
-    /// Index a Markdown file or all Markdown files in a directory
+    /// Index Markdown from all configured source directories
     Index {
-        path: PathBuf,
-
         /// Maximum chunk size in Unicode characters
         #[arg(long)]
         chunk_size: Option<NonZeroUsize>,

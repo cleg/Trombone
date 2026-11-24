@@ -4,21 +4,21 @@ Trombone is a Rust CLI for building a local semantic index of Markdown notes. Th
 
 ## Quick start
 
-You need a current Rust toolchain, a C/C++ compiler for the native dependencies, and a running Ollama server. The [example config](trombone.toml) uses `embeddinggemma` with 768 dimensions.
+You need a current Rust toolchain, a C/C++ compiler for the native dependencies, and a running Ollama server. The [example config](trombone.toml) uses `embeddinggemma-2:740m-bf16` with 768 dimensions.
+
+Set the top-level `roots` array in the TOML before running `tb index`. Put it before the first table header.
+
+```toml
+roots = ["./notes", "/path/to/other/notes"]
+```
 
 ```sh
-ollama pull embeddinggemma
+ollama pull embeddinggemma-2:740m-bf16
 cargo build --locked
-./target/debug/tb --config trombone.toml index /path/to/notes
+./target/debug/tb --config trombone.toml index
 ```
 
-To test indexing on a single note, pass its path to the same command.
-
-```sh
-./target/debug/tb --config trombone.toml index /path/to/note.md
-```
-
-In a terminal, indexing shows live counts, the current file and chunk, and the save and commit stages. When output is redirected, for example through `tee`, it streams plain-text progress lines. The final counts report committed changes.
+`--chunk-size` overrides `[chunking].size` for the pass. In a terminal, indexing shows live counts, the current file and chunk, and the save and commit stages. When output is redirected, for example through `tee`, it streams plain-text progress lines. The final counts report committed changes.
 
 Only one `tb index` or `tb compact` can write to a given database at a time.
 A command that encounters an occupied writer lock exits with a busy message.
@@ -28,7 +28,7 @@ previously published index while a writer prepares changes.
 
 The final summary explicitly states whether the pass was published, whether its vector snapshot changed, and whether automatic compaction ran. It includes indexed, reused, unchanged, and removed document counts, attempted file count, and error count. With a fatal error, committed counts are zero and any prepared work is reported separately. A pass with recoverable errors can publish its successful changes but still exits with a failure status.
 
-Without `--config`, `tb` reads `~/.config/trombone/trombone.toml`. Set `[database].path` to an existing directory. Relative paths resolve against the directory containing the config file after following symlinks. Trombone stores `trombone.sqlite` and `trombone-index-*.usearch` inside that directory. Set `[ollama].model` and `expected_dimensions` together when choosing a model, and use a fresh database directory when changing the model or chunk size for an existing index.
+Without `--config`, `tb` reads `~/.config/trombone/trombone.toml`. Set `[database].path` to an existing directory. Relative paths in `database.path` and `roots` resolve against the directory containing the real config file after following symlinks. Indexing requires at least one directory path and rejects empty paths before opening SQLite or initializing Ollama. Search and compaction can use an existing database without `roots`. Trombone stores `trombone.sqlite` and `trombone-index-*.usearch` inside that directory. Set `[ollama].model` and `expected_dimensions` together when choosing a model, and use a fresh database directory when changing the model or chunk size for an existing index.
 
 Indexes built when Markdown headings were included in chunk text require a rebuild. Point `[database].path` at a fresh directory and run `tb index` on your notes.
 
@@ -54,9 +54,13 @@ At the start of indexing or search, Trombone reads the selected model's digest f
 
 ## How indexing works
 
+The configured `roots` describe the entire desired document set for `database.path`. Each complete pass reconciles the whole database. Configs that share a database but list different roots can therefore remove one another’s documents.
+
 ```mermaid
 flowchart TD
-    files["Markdown files on disk"] --> walk["tb index checks content hashes"]
+    files["Configured roots"] --> walk["Discover and record canonical Markdown paths"]
+    walk -->|Complete walk| cleanup["Remove undiscovered documents"]
+    cleanup --> rows
     walk -->|New content| chunk["Markdown adapter yields chunks"]
     chunk --> input["Hash the prepared model input"]
     input -->|New hash| ollama["Ollama generates embeddings"]
@@ -70,12 +74,13 @@ flowchart TD
 ```
 
 - A file whose content hash matches its saved version is skipped. Byte-identical files share chunk rows and vectors. SQLite stores source paths, byte and line ranges, heading paths, and the keys that identify vectors in USearch. The Markdown files hold the text.
-- Source identities are full canonical paths. Indexing resolves root symlinks and `..` before traversal. The walker skips descendant symlinks. Search reports the stored canonical paths.
+- The walker follows file and directory symlinks, including targets outside the configured roots. It skips recognized cycles and hidden descendant directories by their name on the traversal route. An explicitly configured hidden root is traversed. The canonical file must have the `.md` extension. The index stores and search reports that canonical absolute path. Overlapping roots and multiple routes to the same file share one processing attempt.
 - Chunk size compatibility is checked once before loading the vector snapshot or scanning files. A mismatch aborts the pass with one diagnostic, including for an empty input directory, and leaves existing data unchanged.
 - Markdown headings mark section boundaries. Each chunk spans body text. The configured template controls the input sent to Ollama. Search displays the heading path separately from the original excerpt and its line range.
 - Chunks with identical prepared Ollama input share one vector, even across different files. SQLite stores the full 32-byte BLAKE3 hash and the 64-bit USearch key. The key starts with the first eight hash bytes in little-endian order. If already assigned to a different hash, Trombone probes consecutive keys and skips USearch's reserved key. Existing assignments stay stable while referenced.
-- Each file gets a SQLite savepoint. New vectors go into a temporary SQLite table. If a chunk fails, the savepoint rolls back its file's rows and any new vectors. Trombone reports the error, continues with the remaining files, and publishes successful work. Reported errors still cause a nonzero exit status.
-- After processing the input, Trombone checks stored paths in scope and removes entries for files that have disappeared. A directory includes its descendants. A single-file run checks only the selected path. Filesystem errors that prevent a check leave the affected record in the index. Shared chunks survive while any document still references them.
+- The walker records each discovered canonical Markdown path in a temporary SQLite set before reading it, outside the file savepoint. Read, processing, and embedding errors preserve any previous record and allow work on other files to continue. A processing or embedding error rolls back that file’s rows and new vectors. Storage or savepoint failures abort the transaction.
+- After a complete walk, Trombone removes any document that was undiscovered across all configured roots. Removing a root or symlink drops a document when its last route disappears. An accessible empty directory counts as complete. Shared chunks survive while any document still references them.
+- An unavailable or invalid root, a dangling symlink, or an error enumerating or resolving sources makes the walk incomplete. The summary reports that global deletion was deferred. Successful updates from roots that opened can still publish. If no root opened, the pass ends without publication. Any reported error produces a nonzero exit status.
 - Before committing, Trombone checks keys whose chunk references were removed during the pass. It discards their staged vectors or removes them from the graph, and deletes their SQLite hashes, only if no current chunk references the key. This lets an edited note relink an unchanged chunk before cleanup.
 - When the run adds or removes vectors or compaction is due, Trombone prepares and saves one USearch snapshot before committing SQLite. The commit publishes the snapshot filename and the updated chunk rows together. A pass with no vector changes or compaction reuses the existing snapshot without loading its graph. A failure while applying or publishing vector changes rolls back the pass. The final summary counts indexed and removed files after the commit.
 
@@ -118,7 +123,7 @@ If no live vectors remain and there have been removals, indexing immediately reb
 To defer automatic compaction for one indexing pass:
 
 ```sh
-./target/debug/tb --config trombone.toml index /path/to/notes --no-compact
+./target/debug/tb --config trombone.toml index --no-compact
 ```
 
 The accumulated removal count is stored with the active snapshot in SQLite. It counts removals from the USearch graph. Vectors discarded from SQLite staging never enter the graph. Deferral preserves the count; a later pass can compact even without new removals. Successful manual or automatic compaction resets it to zero. A failed publication leaves the previous snapshot and count unchanged.
@@ -127,7 +132,7 @@ Database schema and vector format versions must exactly match the versions suppo
 
 ## Development
 
-Embedding generation is isolated in `src/embeddings.rs`. Indexing and search use the synchronous `Embedder` interface for chunk embeddings, query embeddings, and embedding settings. `OllamaEmbedder` owns model-specific input formatting, the Ollama client, one reusable Tokio runtime, and response validation. Configuration keeps the same TOML fields, and compaction does not construct an embedder. Document opening and Markdown chunking remain outside this component.
+Embedding generation is isolated in `src/embeddings.rs`. Indexing and search use the synchronous `Embedder` interface for chunk embeddings, query embeddings, and embedding settings. `OllamaEmbedder` owns model-specific input formatting, the Ollama client, one reusable Tokio runtime, and response validation. Compaction does not construct an embedder. Document opening and Markdown chunking remain outside this component.
 
 `indexer` owns the file-processing sequence: unchanged-file decisions, content
 reuse, lazy adapter opening, chunk iteration, vector-key allocation, and vector
@@ -135,7 +140,7 @@ staging. Its file savepoint covers the document and chunk metadata as well as
 new vectors. `database` supplies storage queries and writes, including cached
 chunk and vector inserts, without adapter or embedding callbacks.
 `IndexStatus` belongs to the indexing report types. Persistence orchestration
-regressions live in `src/indexer/storage_tests.rs`.
+regressions live in `src/indexer/tests.rs` and its submodules.
 
 Every chunk carries a typed `SourceLocation` with zero-based, half-open byte offsets and one-based, inclusive line numbers. SQLite stores these coordinates in dedicated integer columns and reconstructs the same type when resolving search candidates. JSON attributes hold additional metadata. Search JSON keeps its existing `line_start` and `line_end` fields.
 

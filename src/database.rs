@@ -156,16 +156,69 @@ pub(crate) fn publish_vector_index(connection: &Connection, index: &VectorIndex)
     Ok(())
 }
 
+/// Return all stored document paths from `connection`, or a SQLite error.
+#[cfg(test)]
 pub(crate) fn document_sources(connection: &Connection) -> Result<Vec<String>> {
     Ok(connection
-        .prepare("SELECT source FROM documents")?
+        .prepare("SELECT source FROM documents ORDER BY source")?
         .query_map([], |row| row.get(0))?
         .collect::<rusqlite::Result<_>>()?)
 }
 
+/// Delete `source` and its unreferenced chunks from `connection`, or return a SQLite error.
+#[cfg(test)]
 pub(crate) fn delete_document(connection: &Connection, source: &str) -> Result<()> {
     // The delete trigger drops chunk rows once the last document sharing them is gone.
     connection.execute("DELETE FROM documents WHERE source = ?1", [source])?;
+    Ok(())
+}
+
+/// Create the set of discovered canonical paths on the pass's `connection`.
+///
+/// Returns success after creating the temporary table, or an SQLite error.
+pub(crate) fn create_source_tracking(connection: &Connection) -> Result<()> {
+    connection.execute_batch(
+        "CREATE TEMP TABLE seen_sources (source BLOB NOT NULL PRIMARY KEY) WITHOUT ROWID;",
+    )?;
+    Ok(())
+}
+
+/// Record canonical `path` on `connection` before processing the source.
+///
+/// Returns true for the first route to the path, false for a duplicate, or an
+/// SQLite error. Non-UTF-8 paths use a blob because documents store UTF-8 text.
+pub(crate) fn mark_source_seen(connection: &Connection, path: &Path) -> Result<bool> {
+    let mut insert = connection.prepare_cached(
+        "INSERT INTO temp.seen_sources (source) VALUES (?1)
+         ON CONFLICT(source) DO NOTHING",
+    )?;
+    let inserted = match path.to_str() {
+        Some(text) => insert.execute([text])?,
+        None => insert.execute([path.as_os_str().as_encoded_bytes()])?,
+    };
+    Ok(inserted == 1)
+}
+
+/// Delete documents absent from the complete set of sources on `connection`.
+///
+/// Calls `removed` for each deleted path. Existing triggers clean up unreferenced
+/// chunks and track their vectors. Returns success or a SQLite error.
+pub(crate) fn delete_unseen_documents(
+    connection: &Connection,
+    mut removed: impl FnMut(&Path),
+) -> Result<()> {
+    let mut statement = connection.prepare(
+        "DELETE FROM documents
+         WHERE NOT EXISTS (
+             SELECT 1 FROM temp.seen_sources WHERE seen_sources.source = documents.source
+         )
+         RETURNING source",
+    )?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        let source: String = row.get(0)?;
+        removed(Path::new(&source));
+    }
     Ok(())
 }
 

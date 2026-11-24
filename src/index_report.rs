@@ -1,7 +1,6 @@
 //! Indexing outcomes and counters independent of console presentation.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
 use std::fmt::Display;
 use std::path::{Path, PathBuf};
 
@@ -60,12 +59,14 @@ pub(crate) struct IndexReport {
     pub(crate) publication: PublicationStatus,
     /// Number of Markdown files whose processing was attempted.
     pub(crate) files_seen: usize,
-    /// Final staged counts, excluding prepared files subsequently deleted in this pass.
+    /// Final staged counts before publication.
     pub(crate) staged: IndexCounts,
     /// Counts made visible by this pass; all zero when nothing was published.
     pub(crate) committed: IndexCounts,
     /// Failures in observation order, including the fatal cause of a rollback.
     pub(crate) errors: Vec<IndexIssue>,
+    /// Whether incomplete discovery prevented a global deletion check.
+    pub(crate) deletions_deferred: bool,
 }
 
 impl IndexReport {
@@ -80,7 +81,7 @@ pub(crate) struct IndexProgress<'a> {
     emit: RefCell<&'a mut dyn FnMut(ProgressEvent<'_>)>,
     files_seen: Cell<usize>,
     counts: Cell<IndexCounts>,
-    prepared: RefCell<HashMap<PathBuf, IndexStatus>>,
+    deletions_deferred: Cell<bool>,
     errors: RefCell<Vec<IndexIssue>>,
 }
 
@@ -91,7 +92,7 @@ impl<'a> IndexProgress<'a> {
             emit: RefCell::new(emit),
             files_seen: Cell::new(0),
             counts: Cell::new(IndexCounts::default()),
-            prepared: RefCell::new(HashMap::new()),
+            deletions_deferred: Cell::new(false),
             errors: RefCell::new(Vec::new()),
         }
     }
@@ -117,30 +118,25 @@ impl<'a> IndexProgress<'a> {
         self.notify(IndexEvent::File(path));
     }
 
-    /// Record and report prepared `status` for `path`, replacing any previous status.
+    /// Record and report the prepared `status` for the unique source `path`.
     pub(crate) fn staged(&self, path: &Path, status: IndexStatus) {
         let mut counts = self.counts.get();
         *counts.counter(&status) += 1;
-        if let Some(previous) = self
-            .prepared
-            .borrow_mut()
-            .insert(path.to_path_buf(), status)
-        {
-            *counts.counter(&previous) -= 1;
-        }
         self.counts.set(counts);
         self.notify(IndexEvent::Staged { path, status });
     }
 
-    /// Record and report removal of `path`, discarding any prepared status.
+    /// Record and report removal of the undiscovered source `path`.
     pub(crate) fn removal(&self, path: &Path) {
         let mut counts = self.counts.get();
-        if let Some(previous) = self.prepared.borrow_mut().remove(path) {
-            *counts.counter(&previous) -= 1;
-        }
         counts.removed += 1;
         self.counts.set(counts);
         self.notify(IndexEvent::Removal(path));
+    }
+
+    /// Remember that an incomplete walk prevented the global deletion check.
+    pub(crate) fn defer_deletions(&self) {
+        self.deletions_deferred.set(true);
     }
 
     /// Record and report `error` with an optional source `path`.
@@ -155,8 +151,8 @@ impl<'a> IndexProgress<'a> {
 
     /// Consume the statistics and build a report for the final `publication` status.
     ///
-    /// Returns staged counts for both outcomes, but committed counts only after
-    /// publication has succeeded.
+    /// Returns staged counts and the deletion status for both outcomes, with
+    /// committed counts populated only after successful publication.
     pub(crate) fn finish(self, publication: PublicationStatus) -> IndexReport {
         let staged = self.counts.get();
         let committed = match publication {
@@ -169,6 +165,7 @@ impl<'a> IndexProgress<'a> {
             staged,
             committed,
             errors: self.errors.into_inner(),
+            deletions_deferred: self.deletions_deferred.get(),
         }
     }
 }

@@ -333,7 +333,7 @@ mod tests {
             chunk_format: None,
         });
         let report = crate::indexer::run(
-            directory.path(),
+            &[directory.path().to_path_buf()],
             NonZeroUsize::new(1_000).unwrap(),
             false,
             &database,

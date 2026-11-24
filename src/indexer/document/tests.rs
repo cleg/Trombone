@@ -4,7 +4,7 @@ use std::path::Path;
 
 use rusqlite::Connection;
 
-use super::{StageOutcome, allocate_vector_key, stage_document, stage_file};
+use super::{StageError, StageOutcome, allocate_vector_key, stage_document, stage_file};
 use crate::adapter::{Attributes, Chunk, Document, DocumentMetadata, SourceLocation};
 use crate::database::{self, *};
 use crate::embeddings::Embedder;
@@ -25,7 +25,10 @@ fn save<'a>(
 ) -> Result<IndexStatus> {
     let transaction = connection.transaction()?;
     ensure_chunk_size(&transaction, chunk_size)?;
-    let status = stage_document(&transaction, path, hash, load_document, None, |_, _| Ok(()))?;
+    let status = stage_document(&transaction, path, hash, load_document, None, |_, _| Ok(()))
+        .map_err(|error| match error {
+            StageError::Processing(error) | StageError::Storage(error) => error,
+        })?;
     transaction.commit()?;
     Ok(status)
 }

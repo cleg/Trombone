@@ -3,7 +3,6 @@
 use std::fs;
 use std::io;
 use std::num::NonZeroUsize;
-use std::ops::ControlFlow;
 use std::path::Path;
 
 use rusqlite::{Connection, Transaction};
@@ -15,36 +14,48 @@ use crate::index_report::{IndexProgress, IndexStatus};
 use crate::processor;
 use crate::progress::IndexEvent;
 
+type Error = Box<dyn std::error::Error + Send + Sync>;
+
+#[derive(Debug)]
+enum StageError {
+    Processing(Error),
+    Storage(Error),
+}
+
 /// File-level outcome after its savepoint and vector changes have been resolved.
 #[derive(Debug)]
 enum StageOutcome {
     /// The file is prepared in the outer transaction and awaits pass publication.
     Staged(IndexStatus),
     /// File rows and new vectors were restored, so continuation is safe.
-    RolledBack(Box<dyn std::error::Error + Send + Sync>),
+    RolledBack(Error),
 }
 
-/// Read and stage one source `path` using `chunk_size` and `embedder`.
+/// Read and stage the discovered source `path` using `chunk_size` and `embedder`.
 ///
-/// `transaction` owns the file savepoint and `progress` records the outcome.
-/// Returns Continue for a staged file, or Break after reporting an
-/// unrecoverable savepoint failure.
+/// `transaction` owns the file savepoint. `progress` records success or a
+/// recoverable read or processing error. Returns success after either outcome.
 ///
 /// # Errors
 ///
-/// Returns file read errors and StageOutcome::RolledBack failures for Walker to
-/// report before continuing with the remaining files.
+/// Returns fatal storage or savepoint failures to abort the pass.
 pub(super) fn process_file(
     path: &Path,
     transaction: &mut Transaction<'_>,
     chunk_size: NonZeroUsize,
     embedder: &dyn Embedder,
     progress: &IndexProgress<'_>,
-) -> io::Result<ControlFlow<()>> {
+) -> Result<()> {
     progress.file(path);
     // Hash and split the same bytes even if the source changes during embedding.
-    let source = fs::read_to_string(path)?;
-    let outcome = stage_file(
+    let source = match fs::read_to_string(path) {
+        Ok(source) => source,
+        Err(error) => {
+            progress.issue(Some(path), &error);
+            return Ok(());
+        }
+    };
+    match stage_file(
         transaction,
         path,
         &source,
@@ -57,18 +68,11 @@ pub(super) fn process_file(
             });
             embedder.embed_chunk(input)
         },
-    );
-    match outcome {
-        Ok(StageOutcome::Staged(status)) => {
-            progress.staged(path, status);
-            Ok(ControlFlow::Continue(()))
-        }
-        Ok(StageOutcome::RolledBack(error)) => Err(io::Error::other(error)),
-        Err(error) => {
-            progress.issue(Some(path), error.as_ref());
-            Ok(ControlFlow::Break(()))
-        }
+    )? {
+        StageOutcome::Staged(status) => progress.staged(path, status),
+        StageOutcome::RolledBack(error) => progress.issue(Some(path), error.as_ref()),
     }
+    Ok(())
 }
 
 /// Stage one file and its new vectors in the same SQLite savepoint.
@@ -88,7 +92,7 @@ pub(super) fn process_file(
 ///
 /// # Errors
 ///
-/// Returns an error if creating, releasing, or rolling back the savepoint fails.
+/// Returns an error if writing to storage or manipulating the savepoint fails.
 /// These failures require aborting the entire indexing pass.
 fn stage_file(
     transaction: &mut Transaction<'_>,
@@ -109,16 +113,18 @@ fn stage_file(
         settings.chunk_format.as_deref(),
         |key, input| {
             ordinal += 1;
-            let vector = embed(input, ordinal)?;
+            let vector = embed(input, ordinal).map_err(StageError::Processing)?;
             if vector.len() != settings.dimensions.get() {
-                return Err(io::Error::other(format!(
-                    "Expected {} vector dimensions, got {}",
-                    settings.dimensions,
-                    vector.len()
-                ))
-                .into());
+                return Err(StageError::Processing(
+                    io::Error::other(format!(
+                        "Expected {} vector dimensions, got {}",
+                        settings.dimensions,
+                        vector.len()
+                    ))
+                    .into(),
+                ));
             }
-            database::stage_vector(&savepoint, key, &vector)
+            database::stage_vector(&savepoint, key, &vector).map_err(StageError::Storage)
         },
     );
     match result {
@@ -127,10 +133,11 @@ fn stage_file(
             savepoint.commit()?;
             Ok(StageOutcome::Staged(status))
         }
-        Err(error) => {
+        Err(StageError::Processing(error)) => {
             savepoint.finish()?;
             Ok(StageOutcome::RolledBack(error))
         }
+        Err(StageError::Storage(error)) => Err(error),
     }
 }
 
@@ -144,49 +151,57 @@ fn stage_file(
 ///
 /// # Errors
 ///
-/// Returns path, adapter, serialization, SQLite, key-allocation, or vector errors.
-/// The caller must roll back the file's savepoint on failure.
+/// Returns recoverable source, adapter, formatting, and embedding errors, or
+/// fatal storage errors. The caller owns rollback.
 fn stage_document<'a>(
     connection: &Connection,
     path: &Path,
     content_hash: &str,
     load_document: impl FnOnce() -> io::Result<Document<'a>>,
     chunk_format: Option<&str>,
-    mut add_vector: impl FnMut(u64, String) -> Result<()>,
-) -> Result<IndexStatus> {
-    let source = path
-        .to_str()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Source path must be UTF-8"))?;
+    mut add_vector: impl FnMut(u64, String) -> std::result::Result<(), StageError>,
+) -> std::result::Result<IndexStatus, StageError> {
+    let source = path.to_str().ok_or_else(|| {
+        StageError::Processing(io::Error::other("Source path must be UTF-8").into())
+    })?;
     // Skip the adapter entirely when this path still has the same content.
-    if database::document_hash(connection, source)?.as_deref() == Some(content_hash) {
+    if database::document_hash(connection, source)
+        .map_err(StageError::Storage)?
+        .as_deref()
+        == Some(content_hash)
+    {
         return Ok(IndexStatus::Unchanged);
     }
 
     // The callback is FnOnce: extraction is deferred until needed and runs once.
-    let document = load_document()?;
+    let document = load_document().map_err(|error| StageError::Processing(error.into()))?;
     if document.metadata.source != path {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "Adapter returned a different source path",
-        )
-        .into());
+        return Err(StageError::Processing(
+            io::Error::other("Adapter returned a different source path").into(),
+        ));
     }
     // Decide reuse using other documents, before replacing this document.
-    let reuse = database::has_other_document(connection, source, content_hash)?;
-    database::replace_document(connection, source, content_hash, &document.metadata)?;
+    let reuse = database::has_other_document(connection, source, content_hash)
+        .map_err(StageError::Storage)?;
+    database::replace_document(connection, source, content_hash, &document.metadata)
+        .map_err(StageError::Storage)?;
     if !reuse {
         for (ordinal, chunk) in document.chunks.enumerate() {
-            let input = format_chunk(chunk_format, chunk.section_path.as_deref(), &chunk.text)?;
+            let input = format_chunk(chunk_format, chunk.section_path.as_deref(), &chunk.text)
+                .map_err(|error| StageError::Processing(error.into()))?;
             let hash = blake3::hash(input.as_bytes());
-            let key = match database::embedding_key(connection, &hash)? {
-                Some(key) => key,
-                None => {
-                    let key = allocate_vector_key(connection, &hash)?;
-                    add_vector(key, input)?;
-                    key
-                }
-            };
-            database::insert_chunk(connection, content_hash, ordinal, key, &chunk)?;
+            let key =
+                match database::embedding_key(connection, &hash).map_err(StageError::Storage)? {
+                    Some(key) => key,
+                    None => {
+                        let key =
+                            allocate_vector_key(connection, &hash).map_err(StageError::Storage)?;
+                        add_vector(key, input)?;
+                        key
+                    }
+                };
+            database::insert_chunk(connection, content_hash, ordinal, key, &chunk)
+                .map_err(StageError::Storage)?;
         }
     }
     Ok(if reuse {
