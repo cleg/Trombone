@@ -5,6 +5,7 @@
 //! before opening the snapshot and validate the index settings afterward.
 
 use std::cell::RefCell;
+use std::fmt;
 use std::fs;
 use std::io;
 use std::mem::DropGuard;
@@ -12,17 +13,20 @@ use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
 use rusqlite::Transaction;
-use usearch::{Index, IndexOptions, MetricKind, ScalarKind};
+use usearch::{Index, IndexMetadata, IndexOptions, MetricKind, ScalarKind};
 
 use crate::config::DatabaseConfig;
-use crate::database::{self, Result, VectorIndex};
+use crate::database::{self, VectorIndex};
 use crate::embeddings::EmbeddingSettings;
+use crate::error::{Error, Result};
 use crate::progress::ProgressEvent;
 
 /// Prefix shared by newly created USearch snapshot filenames.
 pub(crate) const INDEX_PREFIX: &str = "trombone-index-";
 /// Extension shared by USearch snapshot filenames.
 pub(crate) const INDEX_SUFFIX: &str = ".usearch";
+/// Number of random alphanumeric characters in a generated snapshot name.
+const SNAPSHOT_ID_LEN: usize = 6;
 
 /// Create an empty cosine-similarity index with `F32` vectors and one vector per key.
 ///
@@ -41,26 +45,159 @@ pub(crate) fn new_index(dimensions: NonZeroUsize) -> Result<Index> {
     })?)
 }
 
-/// Check that an opened USearch index uses the expected settings.
+/// How to open an existing snapshot's graph.
+pub(crate) enum OpenMode {
+    Load,
+    View,
+}
+
+/// Failure to read or use a particular snapshot.
+#[derive(Debug)]
+pub(crate) struct OpenError {
+    path: PathBuf,
+    failure: OpenFailure,
+}
+
+#[derive(Debug)]
+enum OpenFailure {
+    Access(io::Error),
+    Engine(Error),
+    Incompatible,
+}
+
+impl OpenError {
+    /// Return whether the snapshot file was missing when the open failed.
+    pub(crate) fn is_missing(&self) -> bool {
+        matches!(&self.failure, OpenFailure::Access(error) if error.kind() == io::ErrorKind::NotFound)
+    }
+
+    /// Borrow the failure details for callers that already display the snapshot path.
+    pub(crate) fn reason(&self) -> &dyn fmt::Display {
+        match &self.failure {
+            OpenFailure::Access(error) => error,
+            OpenFailure::Engine(error) => error,
+            OpenFailure::Incompatible => &"Active USearch index has incompatible settings",
+        }
+    }
+}
+
+impl fmt::Display for OpenError {
+    /// Write the failed snapshot path and reason to `formatter`, propagating formatting errors.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "Cannot open active index {}: {}",
+            self.path.display(),
+            self.reason(),
+        )
+    }
+}
+
+impl std::error::Error for OpenError {
+    /// Return the underlying filesystem or USearch error, if any.
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match &self.failure {
+            OpenFailure::Access(error) => Some(error),
+            OpenFailure::Engine(error) => Some(error.as_ref()),
+            OpenFailure::Incompatible => None,
+        }
+    }
+}
+
+/// Open the graph at `path` with the expected vector `dimensions`.
 ///
-/// - `index` is the loaded or memory-mapped snapshot to check.
-/// - `dimensions` is the expected number of components in each vector.
+/// `mode` chooses whether to load a writable copy or memory-map the graph.
+/// Returns the opened index after checking its settings.
 ///
 /// # Errors
 ///
-/// Returns an error if the dimensions differ or the index settings do not
-/// specify cosine similarity, `F32` vectors, and one vector per key.
-pub(crate) fn validate(index: &Index, dimensions: NonZeroUsize) -> io::Result<()> {
-    if index.dimensions() != dimensions.get()
-        || index.metric_kind() != MetricKind::Cos
-        || index.scalar_kind() != ScalarKind::F32
-        || index.multi()
-    {
-        return Err(io::Error::other(
-            "Active USearch index has incompatible settings",
-        ));
+/// Returns a path-specific error if USearch cannot initialize the index, the
+/// graph cannot be read, or its settings differ.
+pub(crate) fn open(
+    path: &Path,
+    dimensions: NonZeroUsize,
+    mode: OpenMode,
+) -> std::result::Result<Index, OpenError> {
+    read_snapshot(path, |filename| {
+        let index = new_index(dimensions).map_err(OpenFailure::Engine)?;
+        match mode {
+            OpenMode::Load => index.load(filename),
+            OpenMode::View => index.view(filename),
+        }
+        .map_err(|error| native_failure(path, error.into()))?;
+        if index.dimensions() != dimensions.get()
+            || !compatible_settings(index.metric_kind(), index.scalar_kind(), index.multi())
+        {
+            return Err(OpenFailure::Incompatible);
+        }
+        Ok(index)
+    })
+}
+
+/// Read the serialized header at `path` and check the expected `dimensions`.
+///
+/// Returns metadata for a regular snapshot file with compatible settings. This
+/// reads only metadata and leaves graph integrity checks to the full open.
+///
+/// # Errors
+///
+/// Returns an error for inaccessible files, invalid headers, or incompatible settings.
+pub(crate) fn read_header(
+    path: &Path,
+    dimensions: NonZeroUsize,
+) -> std::result::Result<IndexMetadata, OpenError> {
+    read_snapshot(path, |filename| {
+        check_regular_file(path).map_err(OpenFailure::Access)?;
+        let header =
+            Index::metadata(filename).map_err(|error| native_failure(path, error.into()))?;
+        if usize::try_from(header.dimensions).ok() != Some(dimensions.get())
+            || !compatible_settings(header.metric, header.quantization, header.multi)
+        {
+            return Err(OpenFailure::Incompatible);
+        }
+        Ok(header)
+    })
+}
+
+/// Return whether `metric`, `scalar` and `multi` match Trombone's graph settings.
+fn compatible_settings(metric: MetricKind, scalar: ScalarKind, multi: bool) -> bool {
+    metric == MetricKind::Cos && scalar == ScalarKind::F32 && !multi
+}
+
+/// Run `read` with the UTF-8 filename for `path`, attaching the path to any failure.
+///
+/// Returns the reader's value or an error for an unsupported path or failed read.
+fn read_snapshot<T>(
+    path: &Path,
+    read: impl FnOnce(&str) -> std::result::Result<T, OpenFailure>,
+) -> std::result::Result<T, OpenError> {
+    utf8_path(path)
+        .map_err(OpenFailure::Access)
+        .and_then(read)
+        .map_err(|failure| OpenError {
+            path: path.to_path_buf(),
+            failure,
+        })
+}
+
+/// Classify a USearch `error` for `path` using a filesystem probe after the failure.
+///
+/// Returns the filesystem error when the file cannot be opened, or the original
+/// engine error when the filesystem probe succeeds.
+fn native_failure(path: &Path, error: Error) -> OpenFailure {
+    match check_regular_file(path).and_then(|()| fs::File::open(path)) {
+        Ok(_) => OpenFailure::Engine(error),
+        Err(error) => OpenFailure::Access(error),
     }
-    Ok(())
+}
+
+/// Check that `path` resolves to a regular file, returning an I/O error otherwise.
+fn check_regular_file(path: &Path) -> io::Result<()> {
+    if fs::metadata(path)?.is_file() {
+        Ok(())
+    } else {
+        Err(io::Error::other("Expected a regular snapshot file"))
+    }
 }
 
 /// Return the path of the active snapshot after checking its metadata.
@@ -75,28 +212,26 @@ pub(crate) fn validate(index: &Index, dimensions: NonZeroUsize) -> io::Result<()
 /// # Errors
 ///
 /// Returns an error if the model, digest, dimensions, or chunk format differ from the
-/// stored values, the dimensions exceed SQLite's integer range, or the stored
-/// name fails the snapshot filename checks.
+/// stored values or the stored name fails the snapshot filename checks.
 pub(crate) fn active_path(
     directory: &Path,
     active: &VectorIndex,
     settings: &EmbeddingSettings,
 ) -> Result<PathBuf> {
-    if active.model != settings.model
-        || active.dimensions != i64::try_from(settings.dimensions.get())?
-    {
+    let stored = &active.settings;
+    if stored.model != settings.model || stored.dimensions != settings.dimensions {
         return Err(io::Error::other(
             "Embedding model or dimensions differ from the active index; use its settings or a new database path",
         )
         .into());
     }
-    if active.model_digest != settings.model_digest {
+    if stored.model_digest != settings.model_digest {
         return Err(io::Error::other(format!(
             "Embedding model digest differs from the active index (indexed {}, current {}); restore the indexed model or rebuild using a fresh database path",
-            active.model_digest, settings.model_digest,
+            stored.model_digest, settings.model_digest,
         )).into());
     }
-    if active.chunk_format != settings.chunk_format {
+    if stored.chunk_format != settings.chunk_format {
         return Err(io::Error::other(
             "ollama.chunk_format differs from the active index; use its setting or a new database path",
         )
@@ -140,17 +275,96 @@ pub(crate) fn utf8_path(path: &Path) -> io::Result<&str> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Index path must be UTF-8"))
 }
 
+/// Remove orphaned Trombone snapshot files from `directory` under the caller's writer lock.
+///
+/// `active` is the snapshot referenced by committed SQLite metadata, if present.
+/// If its directory entry cannot be identified as a regular file, the sweep is
+/// skipped so it cannot remove a symlink's target. `emit` receives nonfatal
+/// directory and removal errors. The sweep ignores unrelated names and nonfiles.
+pub(crate) fn cleanup_orphans(
+    directory: &Path,
+    active: Option<&Path>,
+    emit: &mut dyn FnMut(ProgressEvent<'_>),
+) {
+    if active
+        .is_some_and(|path| !fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file()))
+    {
+        return;
+    }
+    let active_name = active
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str());
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) => {
+            emit(ProgressEvent::SnapshotCleanupFailed {
+                path: directory,
+                error: &error,
+            });
+            return;
+        }
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                emit(ProgressEvent::SnapshotCleanupFailed {
+                    path: directory,
+                    error: &error,
+                });
+                continue;
+            }
+        };
+        let filename = entry.file_name();
+        let Some(name) = filename.to_str() else {
+            continue;
+        };
+        if !is_generated_snapshot_name(name)
+            || active_name.is_some_and(|active| active.eq_ignore_ascii_case(name))
+        {
+            continue;
+        }
+        let path = entry.path();
+        let result = entry.file_type().and_then(|kind| {
+            if kind.is_file() {
+                fs::remove_file(&path)?;
+            }
+            Ok(())
+        });
+        if let Err(error) = result
+            && error.kind() != io::ErrorKind::NotFound
+        {
+            emit(ProgressEvent::SnapshotCleanupFailed {
+                path: &path,
+                error: &error,
+            });
+        }
+    }
+}
+
+/// Return whether `name` matches Trombone's current or legacy generated filenames.
+fn is_generated_snapshot_name(name: &str) -> bool {
+    name.strip_prefix('.')
+        .unwrap_or(name)
+        .strip_prefix(INDEX_PREFIX)
+        .and_then(|name| name.strip_suffix(INDEX_SUFFIX))
+        .is_some_and(|id| {
+            id.len() == SNAPSHOT_ID_LEN && id.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        })
+}
+
 /// Publish a new vector snapshot and commit its metadata atomically with SQLite.
 ///
 /// - `transaction` contains the staged document changes.
-/// - `update` supplies the index and metadata when vectors changed. The generated
-///   snapshot filename replaces the metadata's `file_name` before publication.
+/// - `update` supplies the index and embedding settings when vectors changed.
+///   The snapshot filename is generated when saving the file.
 /// - `database` supplies the database and snapshot locations.
 /// - `previous` is the old snapshot to remove after a successful commit.
 /// - `emit` receives save and commit phases, and any cleanup warnings.
 ///
 /// Returns success after committing. Old snapshot cleanup errors are reported
-/// without failing the committed operation. On failure, a new snapshot is removed
+/// without failing the committed operation. An already removed old file is fine.
+/// On failure, a new snapshot is removed
 /// only if committed SQLite metadata confirms it is unreferenced.
 ///
 /// # Errors
@@ -158,7 +372,7 @@ pub(crate) fn utf8_path(path: &Path) -> io::Result<&str> {
 /// Returns an error if saving, syncing, staging metadata, or committing fails.
 pub(crate) fn commit(
     transaction: Transaction<'_>,
-    update: Option<(&Index, VectorIndex)>,
+    update: Option<(&Index, &EmbeddingSettings)>,
     database: &DatabaseConfig,
     previous: Option<&Path>,
     emit: &mut dyn FnMut(ProgressEvent<'_>),
@@ -166,15 +380,21 @@ pub(crate) fn commit(
     // The pending snapshot's guard and the normal path both emit synchronously.
     let emit = RefCell::new(emit);
     let database_path = database.sqlite_path();
-    let pending_snapshot = if let Some((index, mut metadata)) = update {
+    let pending_snapshot = if let Some((index, settings)) = update {
         (emit.borrow_mut())(ProgressEvent::SavingSnapshot);
         let file = tempfile::Builder::new()
             .prefix(INDEX_PREFIX)
             .suffix(INDEX_SUFFIX)
+            .rand_bytes(SNAPSHOT_ID_LEN)
             .tempfile_in(&database.path)?;
         index.save(utf8_path(file.path())?)?;
         file.as_file().sync_all()?;
-        metadata.file_name = utf8_path(Path::new(file.path().file_name().unwrap()))?.to_owned();
+        let file_name = file
+            .path()
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| io::Error::other("Invalid generated snapshot filename"))?
+            .to_owned();
         let (_, path) = file.keep()?;
         let guard = DropGuard::new(path, |path| {
             if let Err(error) = remove_unreferenced_snapshot(&database_path, &path) {
@@ -186,7 +406,7 @@ pub(crate) fn commit(
         });
         // Make the snapshot and its directory entry durable before publishing its name.
         fs::File::open(&database.path)?.sync_all()?;
-        database::publish_vector_index(&transaction, &metadata)?;
+        database::publish_vector_index(&transaction, &file_name, settings)?;
         Some(guard)
     } else {
         None
@@ -198,6 +418,7 @@ pub(crate) fn commit(
     if saved
         && let Some(path) = previous
         && let Err(error) = fs::remove_file(path)
+        && error.kind() != io::ErrorKind::NotFound
     {
         (emit.borrow_mut())(ProgressEvent::SnapshotCleanupFailed {
             path,
@@ -247,21 +468,18 @@ mod tests {
         // Removal through remove_file must fail for a directory, regardless of permissions.
         let previous = database.path.join("trombone-index-old.usearch");
         fs::create_dir(&previous)?;
-        let metadata = VectorIndex {
-            format_version: database::VECTOR_INDEX_VERSION,
-            file_name: previous.file_name().unwrap().to_str().unwrap().into(),
+        let settings = EmbeddingSettings {
             model: "test-model".into(),
             model_digest: "a".repeat(64),
             chunk_format: None,
-            dimensions: 3,
-            removed_since_compact: 0,
+            dimensions,
         };
-        database::publish_vector_index(&connection, &metadata)?;
+        database::publish_vector_index(&connection, "trombone-index-old.usearch", &settings)?;
         let mut phases = Vec::new();
         let mut warnings = Vec::new();
         commit(
             connection.transaction()?,
-            Some((&index, metadata)),
+            Some((&index, &settings)),
             &database,
             Some(&previous),
             &mut |event| match event {
@@ -271,7 +489,9 @@ mod tests {
                     phases.push("cleanup warning");
                     warnings.push(path.to_path_buf());
                 }
-                ProgressEvent::Index { .. } => unreachable!(),
+                ProgressEvent::Index { .. }
+                | ProgressEvent::Compacting
+                | ProgressEvent::AutomaticCompactionFailed(_) => unreachable!(),
             },
         )?;
         assert_eq!(phases, ["saving", "committing", "cleanup warning"]);
@@ -293,7 +513,7 @@ mod tests {
         let mut cleanup_path = None;
         let failure = commit(
             transaction,
-            Some((&index, active)),
+            Some((&index, &active.settings)),
             &database,
             Some(&active_file),
             &mut |event| match event {

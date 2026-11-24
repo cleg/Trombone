@@ -1,6 +1,6 @@
 use std::io;
 use std::num::NonZeroUsize;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use rusqlite::Connection;
 
@@ -8,6 +8,7 @@ use super::{StageError, StageOutcome, allocate_vector_key, stage_document, stage
 use crate::adapter::{Attributes, Chunk, Document, DocumentMetadata, SourceLocation};
 use crate::database::{self, *};
 use crate::embeddings::Embedder;
+use crate::error::Result;
 use crate::index_report::IndexStatus;
 use crate::indexer::tests::test_embedder;
 use crate::snapshot;
@@ -87,9 +88,9 @@ fn stores_typed_locations_separately_from_extra_attributes() -> Result<()> {
         },
     )?;
     let key = live_vector_keys(&connection)?[0];
-    let sources = chunk_sources(&connection, key)?;
+    let sources = chunk_sources(&connection, key, usize::MAX)?;
     assert_eq!(sources.len(), 1);
-    assert_eq!(sources[0].path, Path::new("note.md"));
+    assert_eq!(sources[0].paths, [PathBuf::from("note.md")]);
     assert_eq!(sources[0].location, location);
     let stored_attributes: String = connection.query_row(
         "SELECT attributes FROM chunks WHERE vector_key = ?1",
@@ -429,7 +430,10 @@ fn failed_file_rollback_restores_staged_vectors_and_chunks() -> Result<()> {
         assert_eq!(vector, &[1.0_f32, 0.0, 0.0]);
         Ok(())
     })?;
-    assert_eq!(database::chunk_sources(&transaction, old_key)?.len(), 1);
+    assert_eq!(
+        database::chunk_sources(&transaction, old_key, usize::MAX)?.len(),
+        1
+    );
     assert!(database::embedding_key(&transaction, &blake3::hash(b"first"))?.is_none());
     assert!(database::removed_vector_keys(&transaction)?.is_empty());
     Ok(())

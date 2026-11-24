@@ -1,25 +1,25 @@
 //! Indexes files in SQLite and maintains the corresponding USearch snapshot.
 //!
 //! Each pass stages document changes and new vectors in SQLite, then removes
-//! records absent from a complete walk of the configured roots. When vectors
-//! change or automatic compaction is due, it saves one snapshot before committing
-//! the documents, counters, and snapshot reference together.
+//! records absent from a complete walk of the configured roots. Vector changes
+//! publish with the documents and their snapshot reference. Automatic
+//! compaction may run afterward in its own transaction.
 
 mod document;
 mod publication;
 
-use std::fs;
-use std::io;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
+use crate::compact;
 use crate::config::DatabaseConfig;
-use crate::database::{self, Result};
+use crate::database;
 use crate::embeddings::Embedder;
+use crate::error::Result;
 use crate::index_report::{IndexProgress, IndexReport, PublicationStatus};
 use crate::progress::{IndexEvent, ProgressEvent};
 use crate::snapshot;
-use crate::walker::{self, WalkOutcome};
+use crate::walker::{self, WalkEvent, WalkOutcome};
 
 use self::document::process_file;
 use self::publication::publish_index;
@@ -30,7 +30,7 @@ use self::publication::publish_index;
 ///
 /// - `roots` is the validated list of configured source directories.
 /// - `chunk_size` is the maximum chunk length in Unicode characters.
-/// - `no_compact` defers automatic rebuilding while preserving removal history.
+/// - `no_compact` skips automatic rebuilding for this pass.
 /// - `database` provides the SQLite and snapshot location.
 /// - `embedder` supplies model settings and generates chunk embeddings.
 /// - `emit` receives synchronous progress and diagnostic events.
@@ -39,6 +39,7 @@ use self::publication::publish_index;
 /// failures. Recoverable errors can coexist with a published pass. Aborted passes
 /// keep their staged counts, report zero committed counts, and retain their
 /// diagnostics without requiring callers to interpret nested results.
+/// Automatic compaction failures emit a warning after successful publication.
 pub(crate) fn run(
     roots: &[PathBuf],
     chunk_size: NonZeroUsize,
@@ -47,46 +48,60 @@ pub(crate) fn run(
     embedder: &dyn Embedder,
     emit: &mut dyn FnMut(ProgressEvent<'_>),
 ) -> IndexReport {
-    let progress = IndexProgress::new(emit);
+    let mut progress = IndexProgress::new(emit);
     if roots.is_empty() {
         progress.issue(None, &"At least one source directory is required");
         return progress.finish(PublicationStatus::NotPublished);
     }
     progress.notify(IndexEvent::Opening(&database.path));
-    let publication = match execute(roots, chunk_size, no_compact, database, embedder, &progress) {
+    let mut publication = match execute(roots, chunk_size, database, embedder, &mut progress) {
         Ok(publication) => publication,
         Err(error) => {
             progress.issue(None, error.as_ref());
             PublicationStatus::NotPublished
         }
     };
+    if !no_compact
+        && let PublicationStatus::Published {
+            snapshot_updated,
+            compacted,
+        } = &mut publication
+    {
+        match compact::run_if_due(database, &mut |event| progress.emit(event)) {
+            Ok(Some(_)) => {
+                *compacted = true;
+                *snapshot_updated = true;
+            }
+            Ok(None) => {}
+            Err(error) => progress.emit(ProgressEvent::AutomaticCompactionFailed(error.as_ref())),
+        }
+    }
     progress.finish(publication)
 }
 
 /// Coordinate preparation, traversal, deletion reconciliation, and publication.
 ///
 /// `roots` defines the desired documents for the database. `chunk_size` limits
-/// chunk length in Unicode characters and `no_compact` defers automatic compaction.
+/// chunk length in Unicode characters.
 /// `database` locates storage, `embedder` supplies model settings and chunk
-/// embeddings, and `progress` records counters and emits events.
+/// embeddings, and `progress` records counters, deletion deferral, and events.
 /// Returns the publication outcome. Recoverable errors allow traversal to
 /// continue. An unopened set of roots or a reported snapshot failure returns
 /// NotPublished.
 /// Validates the pass's chunk size before loading vectors or visiting sources.
-/// Checks the active snapshot path during setup and loads its graph only when
-/// publication needs a replacement.
+/// Checks the active snapshot header and removes orphaned snapshots during setup.
+/// Loads the active graph only when publication needs a replacement.
 ///
 /// # Errors
 ///
-/// Returns unreported setup, database, vector cleanup, rebuild, and publication
+/// Returns unreported setup, database, vector cleanup, and publication
 /// errors for the outer entry point to add to the report.
 fn execute(
     roots: &[PathBuf],
     chunk_size: NonZeroUsize,
-    no_compact: bool,
     database: &DatabaseConfig,
     embedder: &dyn Embedder,
-    progress: &IndexProgress<'_>,
+    progress: &mut IndexProgress<'_>,
 ) -> Result<PublicationStatus> {
     let mut connection = database::open(&database.sqlite_path())?;
     // Acquire the writer lock before choosing a snapshot or allocating vector keys.
@@ -100,44 +115,45 @@ fn execute(
         .map(|active| snapshot::active_path(&database.path, active, settings))
         .transpose()?;
     if let Some(path) = &previous
-        && let Err(error) = fs::metadata(path).and_then(|metadata| {
-            if metadata.is_file() {
-                Ok(())
-            } else {
-                Err(io::Error::other("Expected a regular snapshot file"))
-            }
-        })
+        && let Err(error) = snapshot::read_header(path, settings.dimensions)
     {
-        progress.issue(Some(path), &format!("Cannot access active index: {error}"));
+        progress.issue(
+            Some(path),
+            &format!("Cannot validate active index: {}", error.reason()),
+        );
         return Ok(PublicationStatus::NotPublished);
     }
+    snapshot::cleanup_orphans(&database.path, previous.as_deref(), &mut |event| {
+        progress.emit(event);
+    });
     database::track_removed_vectors(&transaction)?;
     database::create_vector_staging(&transaction)?;
     database::create_source_tracking(&transaction)?;
     let mut any_opened = false;
-    let mut complete = true;
+    let mut all_complete = true;
     for root in roots {
         progress.notify(IndexEvent::Scanning(root));
-        let walked = walker::walk(
-            root,
-            |path| {
-                if database::mark_source_seen(&transaction, path)? {
-                    process_file(path, &mut transaction, chunk_size, embedder, progress)?;
+        let outcome = walker::walk(root, |event| {
+            match event {
+                WalkEvent::File(path) => {
+                    if database::mark_source_seen(&transaction, path)? {
+                        process_file(path, &mut transaction, chunk_size, embedder, progress)?;
+                    }
                 }
-                Ok(())
-            },
-            |path, error| {
-                progress.defer_deletions();
-                progress.issue(Some(path), error);
-            },
-        )?;
-        any_opened |= !matches!(walked, WalkOutcome::Unopened);
-        complete &= matches!(walked, WalkOutcome::Complete);
+                WalkEvent::Issue { path, error } => progress.issue(Some(path), error),
+            }
+            Ok(())
+        })?;
+        any_opened |= !matches!(outcome, WalkOutcome::Unopened);
+        if !matches!(outcome, WalkOutcome::Complete) {
+            all_complete = false;
+            progress.defer_deletions();
+        }
     }
     if !any_opened {
         return Ok(PublicationStatus::NotPublished);
     }
-    if complete {
+    if all_complete {
         progress.notify(IndexEvent::CheckingDeletions);
         database::delete_unseen_documents(&transaction, |path| progress.removal(path))?;
     }
@@ -146,10 +162,6 @@ fn execute(
         database,
         settings,
         previous.as_deref(),
-        active
-            .as_ref()
-            .map_or(0, |active| active.removed_since_compact),
-        no_compact,
         progress,
     )
 }

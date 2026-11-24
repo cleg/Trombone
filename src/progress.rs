@@ -15,6 +15,8 @@ pub(crate) enum ProgressEvent<'a> {
     },
     SavingSnapshot,
     Committing,
+    Compacting,
+    AutomaticCompactionFailed(&'a dyn Display),
     SnapshotCleanupFailed {
         path: &'a Path,
         error: &'a dyn Display,
@@ -30,6 +32,5 @@ pub(crate) enum IndexEvent<'a> {
     Staged { path: &'a Path, status: IndexStatus },
     CheckingDeletions,
     Removal(&'a Path),
-    Compacting,
     Issue(&'a IndexIssue),
 }

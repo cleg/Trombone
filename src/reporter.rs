@@ -44,14 +44,21 @@ impl Reporter {
                     IndexEvent::Staged { path, status } => self.staged(path, status),
                     IndexEvent::CheckingDeletions => self.stage("Checking for deleted files"),
                     IndexEvent::Removal(path) => self.removal(path),
-                    IndexEvent::Compacting => self.stage("Compacting vector index"),
                     IndexEvent::Issue(issue) => self.issue(issue),
                 }
             }
             // Standalone compaction prints its summary and warnings only.
             ProgressEvent::SavingSnapshot if self.indexing => self.stage("Saving USearch snapshot"),
             ProgressEvent::Committing if self.indexing => self.stage("Committing SQLite"),
-            ProgressEvent::SavingSnapshot | ProgressEvent::Committing => {}
+            ProgressEvent::Compacting if self.indexing => self.stage("Compacting vector index"),
+            ProgressEvent::SavingSnapshot
+            | ProgressEvent::Committing
+            | ProgressEvent::Compacting => {}
+            ProgressEvent::AutomaticCompactionFailed(error) => {
+                self.error(format_args!(
+                    "Automatic compaction failed after indexing: {error}"
+                ));
+            }
             ProgressEvent::SnapshotCleanupFailed { path, error } => self.error(format_args!(
                 "Could not clean up index snapshot {}: {error}",
                 path_label(path),
@@ -154,6 +161,15 @@ impl Reporter {
     /// Report the embedding component initialization failure described by `error`.
     pub(crate) fn embedding_init_failed(error: &dyn Display) {
         eprintln!("Failed to initialize embeddings: {error}");
+    }
+
+    /// Warn on stderr that `model` resolved to `current` after indexing started with `initial`.
+    /// Ignores write errors so the warning cannot affect the command's exit status.
+    pub(crate) fn model_digest_changed(model: &str, initial: &str, current: &str) {
+        let _ = writeln!(
+            io::stderr().lock(),
+            "Warning: Ollama model {model} changed during indexing ({initial} → {current}). The published index may contain embeddings from different model versions."
+        );
     }
 
     pub(crate) fn searching_failed(error: &dyn Display) {

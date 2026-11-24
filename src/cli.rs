@@ -4,7 +4,11 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Debug, Parser)]
-#[command(version, about = "Local content indexing and search")]
+#[command(
+    version,
+    propagate_version = true,
+    about = "Local content indexing and search"
+)]
 pub(crate) struct Cli {
     /// Path to the TOML configuration file (default: ~/.config/trombone/trombone.toml)
     #[arg(long, global = true)]
@@ -25,7 +29,7 @@ pub(crate) enum Commands {
         #[arg(long)]
         chunk_size: Option<NonZeroUsize>,
 
-        /// Defer automatic compaction while retaining accumulated removal counts
+        /// Skip automatic compaction for this indexing pass
         #[arg(long)]
         no_compact: bool,
     },
@@ -34,6 +38,7 @@ pub(crate) enum Commands {
     Search {
         query: String,
 
+        /// Maximum number of matching chunks to return
         #[arg(short, long, default_value_t = 5)]
         limit: usize,
 

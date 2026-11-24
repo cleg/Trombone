@@ -8,63 +8,80 @@ use rusqlite::{
 };
 
 use crate::adapter::{Chunk, DocumentMetadata, SourceLocation};
-
-pub(crate) use crate::error::Result;
+use crate::embeddings::EmbeddingSettings;
+use crate::error::Result;
 
 /// Exact SQLite schema version supported by this build, stored in user_version.
 const DATABASE_VERSION: i64 = 6;
 /// Exact vector representation and text preparation version supported by this build.
-pub(crate) const VECTOR_INDEX_VERSION: i64 = 2;
+const VECTOR_INDEX_VERSION: i64 = 2;
 
 /// SQLite's pointer to the active USearch file and the settings used to build it.
 pub(crate) struct VectorIndex {
-    pub(crate) format_version: i64,
     pub(crate) file_name: String,
-    pub(crate) model: String,
-    pub(crate) model_digest: String,
-    pub(crate) chunk_format: Option<String>,
-    pub(crate) dimensions: i64,
-    pub(crate) removed_since_compact: i64,
+    pub(crate) settings: EmbeddingSettings,
 }
 
 pub(crate) struct ChunkSource {
-    pub(crate) path: PathBuf,
+    pub(crate) paths: Vec<PathBuf>,
     pub(crate) content_hash: String,
-    pub(crate) section_path: Option<String>,
+    pub(crate) section_path: Option<Vec<String>>,
     pub(crate) location: SourceLocation,
 }
 
-/// Resolve vector `key` to its source paths and typed locations using `connection`.
+/// Read up to `limit` chunks for vector `key` using `connection`.
 ///
-/// Returns paths in lexical order, including all documents and occurrences sharing the vector.
+/// Returns chunks in row order with typed locations and section paths, and all
+/// source paths in lexical order.
 ///
 /// # Errors
 ///
 /// Returns an error if querying or decoding source metadata fails.
-pub(crate) fn chunk_sources(connection: &Connection, key: u64) -> Result<Vec<ChunkSource>> {
-    let key = key.cast_signed();
+pub(crate) fn chunk_sources(
+    connection: &Connection,
+    key: u64,
+    limit: usize,
+) -> Result<Vec<ChunkSource>> {
     let mut statement = connection.prepare_cached(
-        "SELECT d.source, c.content_hash, c.section_path,
+        "SELECT c.id, d.source, c.content_hash, c.section_path,
                 c.byte_start, c.byte_end, c.line_start, c.line_end
          FROM chunks AS c JOIN documents AS d ON d.content_hash = c.content_hash
-         WHERE c.vector_key = ?1
-         ORDER BY d.source, c.ordinal",
+         WHERE c.id IN (SELECT id FROM chunks WHERE vector_key = ?1 ORDER BY id LIMIT ?2)
+         ORDER BY c.id, d.source",
     )?;
-    Ok(statement
-        .query_map([key], |row| {
-            Ok(ChunkSource {
-                path: row.get::<_, String>(0)?.into(),
-                content_hash: row.get(1)?,
-                section_path: row.get(2)?,
-                location: SourceLocation {
-                    byte_start: location_coordinate(row, 3)?,
-                    byte_end: location_coordinate(row, 4)?,
-                    line_start: location_coordinate(row, 5)?,
-                    line_end: location_coordinate(row, 6)?,
-                },
-            })
-        })?
-        .collect::<rusqlite::Result<_>>()?)
+    let mut rows = statement.query(params![
+        key.cast_signed(),
+        i64::try_from(limit).unwrap_or(i64::MAX)
+    ])?;
+    let mut chunks: Vec<ChunkSource> = Vec::new();
+    let mut previous_id = None;
+    while let Some(row) = rows.next()? {
+        let id = row.get::<_, i64>(0)?;
+        let path = row.get::<_, String>(1)?.into();
+        if previous_id == Some(id)
+            && let Some(chunk) = chunks.last_mut()
+        {
+            chunk.paths.push(path);
+            continue;
+        }
+        let section_path: Option<String> = row.get(3)?;
+        chunks.push(ChunkSource {
+            paths: vec![path],
+            content_hash: row.get(2)?,
+            section_path: section_path
+                .as_deref()
+                .map(serde_json::from_str)
+                .transpose()?,
+            location: SourceLocation {
+                byte_start: location_coordinate(row, 4)?,
+                byte_end: location_coordinate(row, 5)?,
+                line_start: location_coordinate(row, 6)?,
+                line_end: location_coordinate(row, 7)?,
+            },
+        });
+        previous_id = Some(id);
+    }
+    Ok(chunks)
 }
 
 /// Decode a source coordinate from `column` in `row` into an address-sized integer.
@@ -84,73 +101,76 @@ fn location_coordinate(row: &rusqlite::Row<'_>, column: usize) -> rusqlite::Resu
 ///
 /// # Errors
 ///
-/// Returns an error for SQLite failures, an incompatible vector format version,
-/// or chunks without an active snapshot.
+/// Returns an error for SQLite failures, invalid dimensions, an incompatible
+/// vector format version, or chunks without an active snapshot.
 pub(crate) fn vector_index(connection: &Connection) -> Result<Option<VectorIndex>> {
     let index = connection
         .query_row(
-            "SELECT file_name, model, dimensions, chunk_format,
-                    removed_since_compact, format_version, model_digest
+            "SELECT file_name, model, dimensions, chunk_format, format_version, model_digest
              FROM vector_index WHERE id = 1",
             [],
             |row| {
-                Ok(VectorIndex {
-                    file_name: row.get(0)?,
-                    model: row.get(1)?,
-                    model_digest: row.get(6)?,
-                    dimensions: row.get(2)?,
-                    chunk_format: row.get(3)?,
-                    removed_since_compact: row.get(4)?,
-                    format_version: row.get(5)?,
-                })
+                let dimensions = NonZeroUsize::new(location_coordinate(row, 2)?)
+                    .ok_or(rusqlite::Error::IntegralValueOutOfRange(2, 0))?;
+                Ok((
+                    row.get::<_, i64>(4)?,
+                    VectorIndex {
+                        file_name: row.get(0)?,
+                        settings: EmbeddingSettings {
+                            model: row.get(1)?,
+                            model_digest: row.get(5)?,
+                            dimensions,
+                            chunk_format: row.get(3)?,
+                        },
+                    },
+                ))
             },
         )
         .optional()?;
-    if let Some(active) = &index
-        && active.format_version != VECTOR_INDEX_VERSION
-    {
-        return Err(io::Error::other(format!(
-            "Incompatible vector index version {}; expected {VECTOR_INDEX_VERSION}; recreate the database and run tb index",
-            active.format_version
-        ))
-        .into());
+    if let Some((version, active)) = index {
+        if version != VECTOR_INDEX_VERSION {
+            return Err(io::Error::other(format!(
+                "Incompatible vector index version {version}; expected {VECTOR_INDEX_VERSION}; recreate the database and run tb index"
+            )).into());
+        }
+        return Ok(Some(active));
     }
-    if index.is_none()
-        && connection.query_row("SELECT EXISTS(SELECT 1 FROM chunks)", [], |row| {
-            row.get::<_, bool>(0)
-        })?
-    {
+    if connection.query_row("SELECT EXISTS(SELECT 1 FROM chunks)", [], |row| {
+        row.get::<_, bool>(0)
+    })? {
         return Err(io::Error::other("SQLite has chunks but no active USearch index").into());
     }
-    Ok(index)
+    Ok(None)
 }
 
-/// Stage snapshot publication and removal history in `connection`.
+/// Stage snapshot publication in `connection`.
 ///
-/// `index` supplies the filename, format version, embedding identity and digest,
-/// and accumulated removal count. On replacement, format and embedding settings
-/// stay fixed while the filename and counters change. Returns success after
-/// staging the metadata.
+/// `file_name` names a completed snapshot and `settings` describes its embeddings.
+/// On replacement, only the filename changes. Returns success after staging
+/// the metadata.
 ///
 /// # Errors
 ///
-/// Returns an error if SQLite cannot insert or update the metadata.
-pub(crate) fn publish_vector_index(connection: &Connection, index: &VectorIndex) -> Result<()> {
+/// Returns an error if dimensions exceed SQLite's integer range or SQLite
+/// cannot insert or update the metadata.
+pub(crate) fn publish_vector_index(
+    connection: &Connection,
+    file_name: &str,
+    settings: &EmbeddingSettings,
+) -> Result<()> {
     connection.execute(
         "INSERT INTO vector_index
              (id, file_name, model, dimensions, chunk_format,
-              removed_since_compact, format_version, model_digest)
-         VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7)
-         ON CONFLICT(id) DO UPDATE SET file_name = excluded.file_name,
-             removed_since_compact = excluded.removed_since_compact",
+              format_version, model_digest)
+         VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(id) DO UPDATE SET file_name = excluded.file_name",
         params![
-            index.file_name,
-            index.model,
-            index.dimensions,
-            index.chunk_format,
-            index.removed_since_compact,
-            index.format_version,
-            index.model_digest,
+            file_name,
+            settings.model,
+            i64::try_from(settings.dimensions.get())?,
+            settings.chunk_format,
+            VECTOR_INDEX_VERSION,
+            settings.model_digest,
         ],
     )?;
     Ok(())
@@ -376,21 +396,38 @@ pub(crate) fn live_vector_count(connection: &Connection) -> Result<usize> {
     Ok(usize::try_from(count)?)
 }
 
-/// Open or create the database file and initialize its schema.
+/// Open or create the database file, initialize its schema, and enable WAL.
 ///
-/// `path` identifies the database. Returns a writable connection or an error
-/// if opening, acquiring the writer lock, or initializing the schema fails.
+/// `path` identifies the database. `:memory:` opens an in-memory database using
+/// SQLite's memory journal. Returns a writable connection with foreign keys enabled.
+///
+/// # Errors
+///
+/// Returns an error if SQLite cannot open the database, initialize or accept its
+/// schema, or enable WAL on a file-backed database.
 pub(crate) fn open(path: &Path) -> Result<Connection> {
     let mut connection = Connection::open(path)?;
     connection.pragma_update(None, "foreign_keys", true)?;
     initialize(&mut connection)?;
+    if path != Path::new(":memory:") {
+        // Validate the schema first and change journal mode outside its transaction.
+        let mode: String =
+            connection.pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get(0))?;
+        if !mode.eq_ignore_ascii_case("wal") {
+            return Err(io::Error::other(format!(
+                "Could not enable WAL for {} (SQLite reported journal mode {mode})",
+                path.display(),
+            ))
+            .into());
+        }
+    }
     Ok(connection)
 }
 
 /// Acquire the SQLite writer lock on `connection` without waiting for another writer.
 ///
-/// Returns a transaction with the usual five-second busy timeout restored so
-/// publication can wait for brief readers. On acquisition failure the caller
+/// Returns a transaction with the usual five-second busy timeout restored for
+/// subsequent SQLite operations. On acquisition failure the caller
 /// should abandon the connection. Returns an actionable error for lock contention,
 /// or propagates other SQLite failures.
 pub(crate) fn begin_write(connection: &mut Connection) -> Result<Transaction<'_>> {
@@ -661,6 +698,41 @@ pub(crate) fn document_hash(connection: &Connection, source: &str) -> Result<Opt
 mod tests {
     use super::*;
 
+    /// Verify conversion to WAL persists and a writer can commit during a read transaction.
+    ///
+    /// Returns success when the reader retains its original view until its next
+    /// transaction. Propagates temporary-directory and SQLite errors.
+    #[test]
+    fn enables_wal_on_existing_database_and_keeps_readers_on_their_snapshot() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("trombone.sqlite");
+        let mut original = Connection::open(&path)?;
+        original.pragma_update(None, "journal_mode", "DELETE")?;
+        initialize(&mut original)?;
+        drop(original);
+        drop(open(&path)?);
+
+        let mut reader = open_read_only(&path)?;
+        let mode: String = reader.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
+        assert_eq!(mode, "wal");
+        let mut writer = open(&path)?;
+        let read = reader.transaction()?;
+        assert!(document_sources(&read)?.is_empty());
+
+        let write = begin_write(&mut writer)?;
+        write.busy_timeout(Duration::ZERO)?;
+        write.execute(
+            "INSERT INTO documents (source, content_hash) VALUES ('new.md', 'hash')",
+            [],
+        )?;
+        write.commit()?;
+
+        assert!(document_sources(&read)?.is_empty());
+        read.commit()?;
+        assert_eq!(document_sources(&reader)?, ["new.md"]);
+        Ok(())
+    }
+
     /// Verify that incompatible index and database versions are rejected unchanged.
     ///
     /// Returns success when readers and writers reject unsupported versions
@@ -672,18 +744,16 @@ mod tests {
         let connection = open(&path)?;
         publish_vector_index(
             &connection,
-            &VectorIndex {
-                format_version: VECTOR_INDEX_VERSION,
-                file_name: "trombone-index-version.usearch".into(),
+            "trombone-index-version.usearch",
+            &EmbeddingSettings {
                 model: "model".into(),
                 model_digest: "a".repeat(64),
                 chunk_format: None,
-                dimensions: 3,
-                removed_since_compact: 100,
+                dimensions: NonZeroUsize::new(3).unwrap(),
             },
         )?;
         connection.execute(
-            "UPDATE vector_index SET format_version = ?1 WHERE id = 1",
+            "UPDATE vector_index SET format_version = ?1, removed_since_compact = 100 WHERE id = 1",
             [VECTOR_INDEX_VERSION + 1],
         )?;
         assert!(vector_index(&connection).is_err());

@@ -1,7 +1,8 @@
 use std::fs;
 
 use super::{corpus, index, index_roots, test_embedder};
-use crate::database::{self, Result};
+use crate::database;
+use crate::error::Result;
 use crate::snapshot::{self, utf8_path};
 
 /// Verify indexing through a root symlink stores the real path for later passes.
@@ -59,7 +60,9 @@ fn removes_source_replaced_by_directory() -> Result<()> {
     let unique = blake3::hash(b"Unique\n\nUnique paragraph.\n");
     let shared_key = database::embedding_key(&reader, &shared)?.unwrap();
     let unique_key = database::embedding_key(&reader, &unique)?.unwrap();
-    assert_eq!(database::chunk_sources(&reader, shared_key)?.len(), 2);
+    let shared_chunks = database::chunk_sources(&reader, shared_key, 2)?;
+    assert_eq!(shared_chunks.len(), 2);
+    assert!(shared_chunks.iter().all(|chunk| chunk.paths.len() == 1));
 
     fs::remove_file(&note)?;
     fs::create_dir(&note)?;
@@ -70,8 +73,13 @@ fn removes_source_replaced_by_directory() -> Result<()> {
         database::document_sources(&reader)?,
         [survivor.to_str().unwrap()]
     );
-    assert_eq!(database::chunk_sources(&reader, shared_key)?.len(), 1);
-    assert!(database::chunk_sources(&reader, unique_key)?.is_empty());
+    assert_eq!(
+        database::chunk_sources(&reader, shared_key, 1)?[0]
+            .paths
+            .len(),
+        1
+    );
+    assert!(database::chunk_sources(&reader, unique_key, usize::MAX)?.is_empty());
     assert!(database::embedding_key(&reader, &unique)?.is_none());
     let active = database::vector_index(&reader)?.unwrap();
     let published = snapshot::new_index(embedder.settings.dimensions)?;

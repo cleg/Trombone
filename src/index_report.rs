@@ -1,6 +1,5 @@
 //! Indexing outcomes and counters independent of console presentation.
 
-use std::cell::{Cell, RefCell};
 use std::fmt::Display;
 use std::path::{Path, PathBuf};
 
@@ -25,7 +24,7 @@ pub(crate) struct IndexCounts {
 
 impl IndexCounts {
     /// Return the counter associated with the prepared file's `status` in `self`.
-    fn counter(&mut self, status: &IndexStatus) -> &mut usize {
+    fn counter(&mut self, status: IndexStatus) -> &mut usize {
         match status {
             IndexStatus::Indexed => &mut self.indexed,
             IndexStatus::Reused => &mut self.reused,
@@ -78,74 +77,70 @@ impl IndexReport {
 
 /// Mutable pass statistics shared by synchronous traversal and processing callbacks.
 pub(crate) struct IndexProgress<'a> {
-    emit: RefCell<&'a mut dyn FnMut(ProgressEvent<'_>)>,
-    files_seen: Cell<usize>,
-    counts: Cell<IndexCounts>,
-    deletions_deferred: Cell<bool>,
-    errors: RefCell<Vec<IndexIssue>>,
+    emit: &'a mut dyn FnMut(ProgressEvent<'_>),
+    files_seen: usize,
+    counts: IndexCounts,
+    deletions_deferred: bool,
+    errors: Vec<IndexIssue>,
 }
 
 impl<'a> IndexProgress<'a> {
     /// Create empty pass statistics that send events to `emit`.
     pub(crate) fn new(emit: &'a mut dyn FnMut(ProgressEvent<'_>)) -> Self {
         Self {
-            emit: RefCell::new(emit),
-            files_seen: Cell::new(0),
-            counts: Cell::new(IndexCounts::default()),
-            deletions_deferred: Cell::new(false),
-            errors: RefCell::new(Vec::new()),
+            emit,
+            files_seen: 0,
+            counts: IndexCounts::default(),
+            deletions_deferred: false,
+            errors: Vec::new(),
         }
     }
 
     /// Forward `event` to the pass's event sink.
-    pub(crate) fn emit(&self, event: ProgressEvent<'_>) {
-        (self.emit.borrow_mut())(event);
+    pub(crate) fn emit(&mut self, event: ProgressEvent<'_>) {
+        (self.emit)(event);
     }
 
     /// Send `event` with a copy of the current pass counters.
-    pub(crate) fn notify(&self, event: IndexEvent<'_>) {
+    pub(crate) fn notify(&mut self, event: IndexEvent<'_>) {
         self.emit(ProgressEvent::Index {
             event,
-            seen: self.files_seen.get(),
-            staged: self.counts.get(),
-            errors: self.errors.borrow().len(),
+            seen: self.files_seen,
+            staged: self.counts,
+            errors: self.errors.len(),
         });
     }
 
     /// Count and report another Markdown file attempted at `path`.
-    pub(crate) fn file(&self, path: &Path) {
-        self.files_seen.set(self.files_seen.get() + 1);
+    pub(crate) fn file(&mut self, path: &Path) {
+        self.files_seen += 1;
         self.notify(IndexEvent::File(path));
     }
 
     /// Record and report the prepared `status` for the unique source `path`.
-    pub(crate) fn staged(&self, path: &Path, status: IndexStatus) {
-        let mut counts = self.counts.get();
-        *counts.counter(&status) += 1;
-        self.counts.set(counts);
+    pub(crate) fn staged(&mut self, path: &Path, status: IndexStatus) {
+        *self.counts.counter(status) += 1;
         self.notify(IndexEvent::Staged { path, status });
     }
 
     /// Record and report removal of the undiscovered source `path`.
-    pub(crate) fn removal(&self, path: &Path) {
-        let mut counts = self.counts.get();
-        counts.removed += 1;
-        self.counts.set(counts);
+    pub(crate) fn removal(&mut self, path: &Path) {
+        self.counts.removed += 1;
         self.notify(IndexEvent::Removal(path));
     }
 
-    /// Remember that an incomplete walk prevented the global deletion check.
-    pub(crate) fn defer_deletions(&self) {
-        self.deletions_deferred.set(true);
+    /// Record the indexer's decision to defer deletion after incomplete discovery.
+    pub(crate) fn defer_deletions(&mut self) {
+        self.deletions_deferred = true;
     }
 
     /// Record and report `error` with an optional source `path`.
-    pub(crate) fn issue(&self, path: Option<&Path>, error: &dyn Display) {
+    pub(crate) fn issue(&mut self, path: Option<&Path>, error: &dyn Display) {
         let issue = IndexIssue {
             path: path.map(Path::to_path_buf),
             message: error.to_string(),
         };
-        self.errors.borrow_mut().push(issue.clone());
+        self.errors.push(issue.clone());
         self.notify(IndexEvent::Issue(&issue));
     }
 
@@ -154,18 +149,18 @@ impl<'a> IndexProgress<'a> {
     /// Returns staged counts and the deletion status for both outcomes, with
     /// committed counts populated only after successful publication.
     pub(crate) fn finish(self, publication: PublicationStatus) -> IndexReport {
-        let staged = self.counts.get();
+        let staged = self.counts;
         let committed = match publication {
             PublicationStatus::Published { .. } => staged,
             PublicationStatus::NotPublished => IndexCounts::default(),
         };
         IndexReport {
             publication,
-            files_seen: self.files_seen.get(),
+            files_seen: self.files_seen,
             staged,
             committed,
-            errors: self.errors.into_inner(),
-            deletions_deferred: self.deletions_deferred.get(),
+            errors: self.errors,
+            deletions_deferred: self.deletions_deferred,
         }
     }
 }

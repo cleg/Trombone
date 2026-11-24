@@ -214,15 +214,18 @@ impl<'a> ChunkBuilder<'a> {
         }
 
         // Scan each intervening byte at most once, including skipped frontmatter/gaps.
+        let bytes = self.source.as_bytes();
         let line_start = self.line_number
-            + self.source[self.line_offset..range.start]
-                .bytes()
-                .filter(|byte| *byte == b'\n')
+            + (self.line_offset..range.start)
+                .filter(|&offset| ends_line(bytes, offset))
                 .count();
-        let next_line = line_start + text.bytes().filter(|byte| *byte == b'\n').count();
-        let line_end = next_line - usize::from(text.ends_with('\n'));
+        let last = range.end - 1;
+        let line_end = line_start
+            + (range.start..last)
+                .filter(|&offset| ends_line(bytes, offset))
+                .count();
         self.line_offset = range.end;
-        self.line_number = next_line;
+        self.line_number = line_end + usize::from(ends_line(bytes, last));
 
         Some(Chunk {
             text: text.to_owned(),
@@ -240,6 +243,18 @@ impl<'a> ChunkBuilder<'a> {
             }),
             attributes: Attributes::new(),
         })
+    }
+}
+
+/// Return whether the byte at `offset` in the complete Markdown `source` ends a line.
+///
+/// The last byte of LF, CRLF, or a standalone CR ends the line. Looking at the
+/// complete source keeps a CRLF pair together even when a chunk ends at the CR.
+fn ends_line(source: &[u8], offset: usize) -> bool {
+    match source[offset] {
+        b'\n' => true,
+        b'\r' => source.get(offset + 1) != Some(&b'\n'),
+        _ => false,
     }
 }
 
@@ -339,6 +354,45 @@ mod tests {
         assert_eq!(chunks[0].location.line_start, 5);
         assert_eq!(chunks[0].location.line_end, 7);
         assert_source_ranges(source, &chunks, 2000);
+    }
+
+    /// Verify indexed coordinates for Markdown mixing LF, CRLF, and standalone CR.
+    #[test]
+    fn mixed_line_endings_keep_exact_source_coordinates() {
+        let heading = "# Заголовок\r\n\r\n";
+        let body = "Перший\rДругий\nТретій\r";
+        let source = format!("{heading}{body}");
+        let chunks = chunk_markdown(&source, 2000);
+        assert_eq!(chunks.len(), 1);
+        let chunk = &chunks[0];
+        assert_eq!(chunk.text, body);
+        assert_eq!(
+            chunk.location,
+            SourceLocation {
+                byte_start: heading.len(),
+                byte_end: source.len(),
+                line_start: 3,
+                line_end: 5,
+            }
+        );
+    }
+
+    /// Verify a CRLF split across chunks advances the cursor only at the LF.
+    #[test]
+    fn crlf_across_chunk_boundary_counts_as_one_line_break() {
+        let mut builder = ChunkBuilder::new("A\r\nB", 2);
+        let mut remaining = 0..4;
+        let first = builder.push(&mut remaining).unwrap();
+        assert_eq!(first.text, "A\r");
+        assert_eq!((first.location.line_start, first.location.line_end), (1, 1));
+
+        assert!(builder.push(&mut remaining).is_none());
+        let second = builder.flush().unwrap();
+        assert_eq!(second.text, "\nB");
+        assert_eq!(
+            (second.location.line_start, second.location.line_end),
+            (1, 2)
+        );
     }
 
     #[test]

@@ -42,6 +42,7 @@ pub(crate) trait Embedder {
 /// Ollama implementation owning the client, input formats, and one Tokio runtime.
 pub(crate) struct OllamaEmbedder {
     client: Ollama,
+    http_client: reqwest::Client,
     runtime: Runtime,
     settings: EmbeddingSettings,
     query_format: Option<String>,
@@ -79,14 +80,16 @@ impl OllamaEmbedder {
             .enable_all()
             .build()?;
         let request_timeout = Duration::from_secs(config.request_timeout_secs.get());
-        let model_digest = request_with_timeout(
+        let model_digest = resolve_model_digest(
             &runtime,
             request_timeout,
-            "model metadata lookup",
-            resolve_model_digest(&http_client, &client, &config.model),
+            &http_client,
+            &client,
+            &config.model,
         )?;
         Ok(Self {
             client,
+            http_client,
             runtime,
             settings: EmbeddingSettings {
                 model: config.model.clone(),
@@ -97,6 +100,25 @@ impl OllamaEmbedder {
             query_format: config.query_format.clone(),
             request_timeout,
         })
+    }
+
+    /// Return the current digest if the model tag now resolves to a different version.
+    ///
+    /// Returns `None` when the tag still resolves to the digest captured at startup.
+    /// The original embedding settings remain available for snapshot compatibility.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if Ollama is unavailable or no longer reports a valid digest.
+    pub(crate) fn changed_model_digest(&self) -> Result<Option<String>> {
+        let current = resolve_model_digest(
+            &self.runtime,
+            self.request_timeout,
+            &self.http_client,
+            &self.client,
+            &self.settings.model,
+        )?;
+        Ok((current != self.settings.model_digest).then_some(current))
     }
 
     /// Request one embedding for already formatted `text` using this client's runtime.
@@ -157,24 +179,29 @@ struct AvailableModels {
 
 /// Resolve `model` through `client`'s server using the shared `http_client`.
 ///
-/// Returns its normalized SHA-256 digest without generating an embedding.
+/// Runs on `runtime` with the specified `timeout`. Returns the normalized
+/// SHA-256 digest without generating an embedding.
 ///
 /// # Errors
 ///
-/// Returns an error for HTTP or JSON failures, a missing model, or an invalid digest.
-async fn resolve_model_digest(
+/// Returns an error for timeouts, HTTP or JSON failures, a missing model, or an invalid digest.
+fn resolve_model_digest(
+    runtime: &Runtime,
+    timeout: Duration,
     http_client: &reqwest::Client,
     client: &Ollama,
     model: &str,
 ) -> Result<String> {
-    let available: AvailableModels = http_client
-        .get(format!("{}api/tags", client.url_str()))
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
-    select_model_digest(&available.models, model)
+    request_with_timeout(runtime, timeout, "model metadata lookup", async {
+        let available: AvailableModels = http_client
+            .get(format!("{}api/tags", client.url_str()))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        select_model_digest(&available.models, model)
+    })
 }
 
 /// Select `model` from `available`, treating an omitted tag as `latest`.
@@ -525,7 +552,7 @@ mod tests {
 
         let hits = search::run("raw query".into(), 5, &database, &embedder)?;
         assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].text, body);
+        assert_eq!(hits[0].text.as_deref(), Some(body));
         assert_eq!(hits[0].line_start, 3);
         assert_eq!(hits[0].line_end, 4);
         assert_eq!(hits[0].section_path, Some(vec!["Корінь 🙂".into()]));
@@ -557,6 +584,7 @@ mod tests {
         assert_eq!(
             crate::database::vector_index(&connection)?
                 .unwrap()
+                .settings
                 .model_digest,
             digest
         );

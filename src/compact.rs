@@ -1,4 +1,4 @@
-//! Rebuilds the vector snapshot from keys still referenced by SQLite chunks.
+//! Rebuilds USearch to reclaim deleted slots and drop vectors SQLite no longer references.
 
 use std::io;
 use std::num::NonZeroUsize;
@@ -6,9 +6,10 @@ use std::num::NonZeroUsize;
 use usearch::Index;
 
 use crate::config::DatabaseConfig;
-use crate::database::{self, Result};
+use crate::database;
+use crate::error::Result;
 use crate::progress::ProgressEvent;
-use crate::snapshot;
+use crate::snapshot::{self, OpenMode};
 
 /// Counts of searchable vectors before and after a committed compaction.
 pub(crate) struct CompactReport {
@@ -23,8 +24,8 @@ pub(crate) struct CompactReport {
 /// and preserves the model digest and vector keys. Holds the writer lock
 /// through publication so indexing cannot change the starting snapshot.
 /// Returns committed vector counts, or `None` when there is no active index.
-/// Resets accumulated removal history on successful publication. Source files
-/// and the embedding service are not accessed.
+/// Removes orphaned snapshot files while holding the writer lock.
+/// Source files and the embedding service are not accessed.
 ///
 /// # Errors
 ///
@@ -35,17 +36,57 @@ pub(crate) fn run(
     database: &DatabaseConfig,
     emit: &mut dyn FnMut(ProgressEvent<'_>),
 ) -> Result<Option<CompactReport>> {
+    run_with_policy(database, false, emit)
+}
+
+/// Compact the published index in `database` if it has enough holes or surplus vectors.
+///
+/// `emit` receives progress events. Returns the report after publication or
+/// `None` when there is no active snapshot or compaction is not due.
+///
+/// # Errors
+///
+/// Returns writer lock, metadata, SQLite, snapshot, and publication errors.
+pub(crate) fn run_if_due(
+    database: &DatabaseConfig,
+    emit: &mut dyn FnMut(ProgressEvent<'_>),
+) -> Result<Option<CompactReport>> {
+    run_with_policy(database, true, emit)
+}
+
+/// Rebuild the committed graph in `database` under an independent writer lock.
+///
+/// `only_if_due` enables the automatic threshold. `emit` receives progress.
+/// Returns committed counts, or `None` if no rebuild was needed.
+///
+/// # Errors
+///
+/// Returns an error if locking, reading, rebuilding, or publishing fails.
+fn run_with_policy(
+    database: &DatabaseConfig,
+    only_if_due: bool,
+    emit: &mut dyn FnMut(ProgressEvent<'_>),
+) -> Result<Option<CompactReport>> {
     let mut connection = database::open(&database.sqlite_path())?;
     let transaction = database::begin_write(&mut connection)?;
-    let Some(mut active) = database::vector_index(&transaction)? else {
+    let Some(active) = database::vector_index(&transaction)? else {
+        if !only_if_due {
+            snapshot::cleanup_orphans(&database.path, None, emit);
+        }
         return Ok(None);
     };
-    let dimensions = NonZeroUsize::new(usize::try_from(active.dimensions)?)
-        .ok_or_else(|| io::Error::other("Active index has zero dimensions"))?;
+    let dimensions = active.settings.dimensions;
     let previous = snapshot::stored_path(&database.path, &active)?;
-    let source = snapshot::new_index(dimensions)?;
-    source.view(snapshot::utf8_path(&previous)?)?;
-    snapshot::validate(&source, dimensions)?;
+    if only_if_due {
+        let header = snapshot::read_header(&previous, dimensions)?;
+        let referenced = u64::try_from(database::live_vector_count(&transaction)?)?;
+        if !should_compact(header.count_present, header.count_deleted, referenced) {
+            return Ok(None);
+        }
+    }
+    emit(ProgressEvent::Compacting);
+    let source = snapshot::open(&previous, dimensions, OpenMode::View)?;
+    snapshot::cleanup_orphans(&database.path, Some(&previous), emit);
 
     let keys = database::live_vector_keys(&transaction)?;
     let rebuilt = rebuild(&source, &keys, dimensions)?;
@@ -55,10 +96,9 @@ pub(crate) fn run(
     };
     // Release the memory map before publication can remove the old snapshot.
     drop(source);
-    active.removed_since_compact = 0;
     snapshot::commit(
         transaction,
-        Some((&rebuilt, active)),
+        Some((&rebuilt, &active.settings)),
         database,
         Some(&previous),
         emit,
@@ -78,7 +118,7 @@ pub(crate) fn run(
 /// # Errors
 ///
 /// Returns an error for missing embeddings or USearch failures.
-pub(crate) fn rebuild(source: &Index, keys: &[u64], dimensions: NonZeroUsize) -> Result<Index> {
+fn rebuild(source: &Index, keys: &[u64], dimensions: NonZeroUsize) -> Result<Index> {
     let rebuilt = snapshot::new_index(dimensions)?;
     if !keys.is_empty() {
         rebuilt.reserve(keys.len())?;
@@ -93,35 +133,45 @@ pub(crate) fn rebuild(source: &Index, keys: &[u64], dimensions: NonZeroUsize) ->
     Ok(rebuilt)
 }
 
-/// Decide whether accumulated graph deletions justify an automatic rebuild.
+/// Decide whether reclaiming holes or dropping surplus vectors justifies rebuilding.
 ///
-/// `live_vectors` counts current SQLite chunks; `removed_since_compact` counts
-/// vector removals since the last published rebuild. Returns true at 100 removals
-/// and a removal fraction of at least 25% of live-plus-removed vectors. An empty
-/// live index with any removals is rebuilt immediately. Integer arithmetic avoids
-/// rounding and overflow even for large counts.
-pub(crate) fn should_compact(live_vectors: usize, removed_since_compact: i64) -> bool {
-    removed_since_compact > 0
-        && (live_vectors == 0
-            || (removed_since_compact >= 100
-                && (removed_since_compact as u128) * 3 >= live_vectors as u128))
+/// `present` and `deleted` are the live vectors and still-empty slots in the
+/// USearch header. `referenced` counts distinct keys used by SQLite chunks.
+/// Returns true for an empty graph with holes or an index with at least 100
+/// holes that occupy at least 25% of its slots. Also returns true for any live
+/// vectors when SQLite references none, or for a surplus of at least 10 vectors
+/// and at least 10% of the SQLite count. A count comparison detects net surplus.
+fn should_compact(present: u64, deleted: u64, referenced: u64) -> bool {
+    // USearch reuses deleted slots. Its current header reflects the remaining holes.
+    let many_holes = (present == 0 && deleted > 0)
+        || (deleted >= 100 && u128::from(deleted) * 3 >= u128::from(present));
+    // SQLite is the source of truth when the graph still considers extra vectors live.
+    let surplus = present.saturating_sub(referenced);
+    let many_surplus = (referenced == 0 && surplus > 0)
+        || (surplus >= 10 && u128::from(surplus) * 10 >= u128::from(referenced));
+    many_holes || many_surplus
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Verify both threshold boundaries, immediate empty-index cleanup, and large counts.
+    /// Verify the hole and surplus thresholds, empty-index cases, and large counts.
     #[test]
-    fn automatic_compaction_requires_the_minimum_and_removal_fraction() {
-        assert!(!should_compact(100, 99));
-        assert!(!should_compact(301, 100));
-        assert!(should_compact(300, 100));
-        assert!(!should_compact(1_000, 333));
-        assert!(should_compact(1_000, 334));
-        assert!(!should_compact(0, 0));
-        assert!(should_compact(0, 1));
-        assert!(should_compact(300, i64::MAX));
+    fn automatic_compaction_checks_holes_and_live_vector_surplus() {
+        assert!(!should_compact(100, 99, 100));
+        assert!(!should_compact(301, 100, 301));
+        assert!(should_compact(300, 100, 300));
+        assert!(!should_compact(0, 0, 0));
+        assert!(should_compact(0, 1, 0));
+        assert!(should_compact(300, u64::MAX, 300));
+
+        assert!(!should_compact(99, 0, 90));
+        assert!(!should_compact(111, 0, 101));
+        assert!(should_compact(110, 0, 100));
+        assert!(should_compact(1, 0, 0));
+        assert!(!should_compact(1, 0, 2));
+        assert!(should_compact(u64::MAX, 0, 1));
     }
 
     /// Verify that rebuilding preserves live embeddings and excludes obsolete keys.
@@ -165,7 +215,7 @@ mod tests {
     /// Verify publication, shared chunks, stored settings, and an empty live index.
     ///
     /// Returns success when compaction preserves metadata and replaces snapshots;
-    /// verifies that removal history resets while model digest and locations survive, and
+    /// verifies that the model digest and locations survive, and
     /// propagates filesystem, SQLite, and USearch errors.
     #[test]
     fn compact_publishes_live_vectors_and_preserves_metadata() -> Result<()> {
@@ -183,14 +233,12 @@ mod tests {
         source.save(snapshot::utf8_path(&old_path)?)?;
         database::publish_vector_index(
             &connection,
-            &database::VectorIndex {
-                format_version: database::VECTOR_INDEX_VERSION,
-                file_name: "trombone-index-before.usearch".into(),
+            "trombone-index-before.usearch",
+            &crate::embeddings::EmbeddingSettings {
                 model: "stored-model".into(),
                 model_digest: "a".repeat(64),
                 chunk_format: Some("{text}".into()),
-                dimensions: 3,
-                removed_since_compact: 321,
+                dimensions,
             },
         )?;
         connection.execute_batch(
@@ -205,13 +253,13 @@ mod tests {
         assert_eq!(report.previous_vectors, 2);
         assert_eq!(report.retained_vectors, 1);
         let active = database::vector_index(&connection)?.unwrap();
-        assert_eq!(active.model, "stored-model");
-        assert_eq!(active.model_digest, "a".repeat(64));
-        assert_eq!(active.chunk_format.as_deref(), Some("{text}"));
-        assert_eq!(active.dimensions, 3);
-        assert_eq!(active.removed_since_compact, 0);
-        let sources = database::chunk_sources(&connection, 2)?;
-        assert_eq!(sources.len(), 2);
+        assert_eq!(active.settings.model, "stored-model");
+        assert_eq!(active.settings.model_digest, "a".repeat(64));
+        assert_eq!(active.settings.chunk_format.as_deref(), Some("{text}"));
+        assert_eq!(active.settings.dimensions, dimensions);
+        let sources = database::chunk_sources(&connection, 2, usize::MAX)?;
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].paths.len(), 2);
         assert!(sources.iter().all(|source| source.location
             == crate::adapter::SourceLocation {
                 byte_start: 0,

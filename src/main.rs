@@ -22,7 +22,8 @@ use std::process::ExitCode;
 
 use cli::{Cli, Commands, OutputFormat};
 use config::Config;
-use embeddings::OllamaEmbedder;
+use embeddings::{Embedder, OllamaEmbedder};
+use index_report::PublicationStatus;
 use reporter::Reporter;
 use search_output::{ConsoleOutput, JsonOutput, SearchOutput};
 
@@ -34,6 +35,7 @@ use search_output::{ConsoleOutput, JsonOutput, SearchOutput};
 /// The report can include published work alongside recoverable errors. Indexing
 /// validates its root list before initializing embeddings or opening storage.
 /// Indexing and search initialize the embedding client before entering their core operations.
+/// A published indexing pass also checks for model changes and warns on a mismatch.
 /// Progress events are rendered by the console reporter here.
 fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -88,6 +90,12 @@ fn main() -> ExitCode {
                 &mut |event| reporter.handle(event),
             );
             reporter.finish();
+            if matches!(report.publication, PublicationStatus::Published { .. })
+                && let Ok(Some(current)) = embedder.changed_model_digest()
+            {
+                let settings = embedder.settings();
+                Reporter::model_digest_changed(&settings.model, &settings.model_digest, &current);
+            }
             if let Err(error) = Reporter::indexed(&report) {
                 Reporter::indexing_failed(&error);
                 return ExitCode::FAILURE;

@@ -53,5 +53,6 @@ CREATE TABLE IF NOT EXISTS vector_index (
     model_digest TEXT NOT NULL CHECK (length(model_digest) > 0),
     chunk_format TEXT,
     dimensions INTEGER NOT NULL CHECK (dimensions > 0),
+    -- Legacy column retained for compatibility with existing version 6 databases.
     removed_since_compact INTEGER NOT NULL DEFAULT 0 CHECK (removed_since_compact >= 0)
 );

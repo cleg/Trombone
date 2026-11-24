@@ -9,8 +9,9 @@ use std::path::{Path, PathBuf};
 use super::run;
 use crate::compact;
 use crate::config::DatabaseConfig;
-use crate::database::{self, Result};
+use crate::database;
 use crate::embeddings::{Embedder, EmbeddingSettings};
+use crate::error::Result;
 use crate::index_report::{IndexCounts, IndexReport, PublicationStatus};
 use crate::progress::{IndexEvent, ProgressEvent};
 use crate::snapshot::{self, utf8_path};
@@ -176,7 +177,7 @@ fn one_writer_per_database_allows_parallel_search() -> Result<()> {
             let hits = crate::search::run("query".into(), 1, &database, &embedder)
                 .expect("the published index remains searchable during indexing");
             assert_eq!(hits.len(), 1);
-            assert_eq!(hits[0].text, text);
+            assert_eq!(hits[0].text.as_deref(), Some(text));
         },
     );
     assert!(report.is_success(), "{:?}", report.errors);
@@ -210,7 +211,7 @@ fn prepared_input_hash_reuses_vectors_across_edits_and_files() -> Result<()> {
         database::vector_index(&reader)?.unwrap().file_name,
         original
     );
-    let sources = database::chunk_sources(&reader, key)?;
+    let sources = database::chunk_sources(&reader, key, usize::MAX)?;
     assert_eq!(sources.len(), 1);
     assert_eq!(sources[0].location.line_start, 4);
 
@@ -221,8 +222,16 @@ fn prepared_input_hash_reuses_vectors_across_edits_and_files() -> Result<()> {
     )?;
     assert!(index(directory.path(), &database, &embedder).is_success());
     assert_eq!(embedder.calls.get(), 2);
-    assert_eq!(database::chunk_sources(&reader, key)?.len(), 2);
+    assert_eq!(database::chunk_sources(&reader, key, usize::MAX)?.len(), 2);
     assert_eq!(database::live_vector_count(&reader)?, 2);
+    let hits = crate::search::run("query".into(), 3, &database, &embedder)?;
+    assert_eq!(hits.len(), 3);
+    assert_eq!(
+        hits.iter()
+            .filter(|hit| hit.text.as_deref() == Some("Shared paragraph.\n"))
+            .count(),
+        2
+    );
 
     let report = compact::run(&database, &mut |_| {})?.unwrap();
     assert_eq!(report.retained_vectors, 2);
@@ -233,7 +242,7 @@ fn prepared_input_hash_reuses_vectors_across_edits_and_files() -> Result<()> {
     let hits = crate::search::run("query".into(), 5, &database, &embedder)?;
     assert_eq!(
         hits.iter()
-            .filter(|hit| hit.text == "Shared paragraph.\n")
+            .filter(|hit| hit.text.as_deref() == Some("Shared paragraph.\n"))
             .count(),
         1
     );
@@ -579,7 +588,7 @@ fn a_file_remains_seen_until_the_next_pass() -> Result<()> {
     Ok(())
 }
 
-/// Verify traversal and snapshot-load failures each return one diagnostic without publication.
+/// Verify missing roots and missing or truncated snapshots each abort with one diagnostic.
 ///
 /// Returns success on the aborted reports; propagates fixture and metadata errors.
 #[test]
@@ -598,13 +607,52 @@ fn traversal_and_snapshot_failures_return_reports_without_duplicate_errors() -> 
     let connection = database::open_read_only(&database.sqlite_path())?;
     let active = database::vector_index(&connection)?.unwrap();
     let snapshot = database.path.join(&active.file_name);
+    fs::write(&snapshot, b"")?;
+    let truncated = index(directory.path(), &database, &embedder);
     fs::remove_file(&snapshot)?;
+    let missing = index(directory.path(), &database, &embedder);
+    for report in [truncated, missing] {
+        assert_eq!(report.publication, PublicationStatus::NotPublished);
+        assert_eq!(report.errors.len(), 1);
+        assert_eq!(report.errors[0].path.as_deref(), Some(snapshot.as_path()));
+        assert_eq!(report.files_seen, 0);
+        assert_eq!(report.staged, IndexCounts::default());
+        assert_eq!(report.committed, IndexCounts::default());
+    }
+    Ok(())
+}
+
+/// Verify unchanged indexing and manual compaction clean up orphaned snapshots.
+///
+/// Returns success if the active snapshot and unrelated entries are preserved
+/// during the sweep. Propagates fixture, compaction, and storage errors.
+#[test]
+fn writers_remove_only_orphaned_generated_snapshot_files() -> Result<()> {
+    let (directory, database) = corpus()?;
+    fs::write(directory.path().join("note.md"), "Indexed text.")?;
+    let embedder = test_embedder(None, None);
+    assert!(index(directory.path(), &database, &embedder).is_success());
+    let connection = database::open_read_only(&database.sqlite_path())?;
+    let active = database::vector_index(&connection)?.unwrap();
+    let active_path = snapshot::stored_path(&database.path, &active)?;
+    let orphan = directory.path().join(".trombone-index-Ab12Cd.usearch");
+    let backup = directory.path().join("trombone-index-backup-copy.usearch");
+    let subdirectory = directory.path().join(".trombone-index-Xy34Zz.usearch");
+    fs::write(&orphan, b"")?;
+    fs::write(&backup, b"keep")?;
+    fs::create_dir(&subdirectory)?;
+
     let report = index(directory.path(), &database, &embedder);
-    assert_eq!(report.publication, PublicationStatus::NotPublished);
-    assert_eq!(report.errors.len(), 1);
-    assert_eq!(report.errors[0].path.as_deref(), Some(snapshot.as_path()));
-    assert_eq!(report.staged, IndexCounts::default());
-    assert_eq!(report.committed, IndexCounts::default());
+    assert!(report.is_success(), "{:?}", report.errors);
+    assert_eq!(report.committed.unchanged, 1);
+    assert!(!orphan.exists());
+    assert!(active_path.is_file());
+
+    fs::write(&orphan, b"")?;
+    assert!(compact::run(&database, &mut |_| {})?.is_some());
+    assert!(!orphan.exists());
+    assert_eq!(fs::read_to_string(backup)?, "keep");
+    assert!(subdirectory.is_dir());
     Ok(())
 }
 

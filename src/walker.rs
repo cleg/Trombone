@@ -7,7 +7,16 @@ use std::path::{Path, PathBuf};
 
 use crate::error::Result;
 
-/// Whether a configured root could be opened and fully enumerated.
+/// A discovered file or a filesystem issue that made discovery incomplete.
+pub(crate) enum WalkEvent<'a> {
+    File(&'a Path),
+    Issue {
+        path: &'a Path,
+        error: &'a io::Error,
+    },
+}
+
+/// Completeness of a traversal of one configured root.
 pub(crate) enum WalkOutcome {
     Unopened,
     Partial,
@@ -16,18 +25,17 @@ pub(crate) enum WalkOutcome {
 
 /// Visit the canonical Markdown files reachable from directory `root`.
 ///
-/// `visit` receives each discovered route's canonical file. `report_error`
-/// receives traversal failures with the path where available. Returns whether
-/// the root opened and whether discovery was complete. Hidden descendant
-/// directories and recognized symlink loops are skipped.
+/// `emit` receives each discovered route's canonical file and any filesystem
+/// issues. Returns `Unopened` if the root cannot be opened, `Partial` if a
+/// filesystem issue interrupts part of the walk, or `Complete` otherwise.
+/// Hidden descendant directories and recognized loops are skipped.
 ///
 /// # Errors
 ///
-/// Propagates fatal errors from `visit`, stopping traversal immediately.
+/// Propagates fatal errors from `emit`, stopping traversal immediately.
 pub(crate) fn walk(
     root: &Path,
-    mut visit: impl FnMut(&Path) -> Result<()>,
-    mut report_error: impl FnMut(&Path, &io::Error),
+    mut emit: impl FnMut(WalkEvent<'_>) -> Result<()>,
 ) -> Result<WalkOutcome> {
     let opened = fs::canonicalize(root).and_then(|path| {
         let entries = fs::read_dir(&path)?;
@@ -36,12 +44,14 @@ pub(crate) fn walk(
     let mut stack = match opened {
         Ok(opened) => vec![opened],
         Err(error) => {
-            report_error(root, &error);
+            emit(WalkEvent::Issue {
+                path: root,
+                error: &error,
+            })?;
             return Ok(WalkOutcome::Unopened);
         }
     };
     let mut outcome = WalkOutcome::Complete;
-
     while let Some((directory, entries)) = stack.last_mut() {
         let Some(entry) = entries.next() else {
             stack.pop();
@@ -50,8 +60,11 @@ pub(crate) fn walk(
         let entry = match entry {
             Ok(entry) => entry,
             Err(error) => {
-                report_error(directory, &error);
                 outcome = WalkOutcome::Partial;
+                emit(WalkEvent::Issue {
+                    path: directory,
+                    error: &error,
+                })?;
                 continue;
             }
         };
@@ -59,20 +72,26 @@ pub(crate) fn walk(
             Ok(Some(source)) => source,
             Ok(None) => continue,
             Err(error) => {
-                report_error(&entry.path(), &error);
                 outcome = WalkOutcome::Partial;
+                emit(WalkEvent::Issue {
+                    path: &entry.path(),
+                    error: &error,
+                })?;
                 continue;
             }
         };
 
         if kind.is_file() {
-            visit(&path)?;
+            emit(WalkEvent::File(&path))?;
         } else if !stack.iter().any(|(ancestor, _)| ancestor == &path) {
             match fs::read_dir(&path) {
                 Ok(entries) => stack.push((path, entries)),
                 Err(error) => {
-                    report_error(&path, &error);
                     outcome = WalkOutcome::Partial;
+                    emit(WalkEvent::Issue {
+                        path: &path,
+                        error: &error,
+                    })?;
                 }
             }
         }

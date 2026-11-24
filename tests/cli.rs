@@ -2,6 +2,46 @@ use std::fs;
 use std::io;
 use std::process::Command;
 
+/// Verify global and subcommand help and version work with a missing or invalid config.
+///
+/// Returns success after checking stdout and the exit status for each invocation,
+/// or propagates a fixture or process-launch error.
+#[test]
+fn help_and_version_work_without_a_usable_config() -> io::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let missing = directory.path().join("missing.toml");
+    let invalid = directory.path().join("invalid.toml");
+    fs::write(&invalid, "[invalid")?;
+
+    for config in [&missing, &invalid] {
+        for subcommand in [None, Some("index"), Some("search"), Some("compact")] {
+            for (flag, expected) in [
+                ("--help", "Usage:"),
+                ("--version", env!("CARGO_PKG_VERSION")),
+            ] {
+                let result = Command::new(env!("CARGO_BIN_EXE_tb"))
+                    .arg("--config")
+                    .arg(config)
+                    .args(subcommand)
+                    .arg(flag)
+                    .output()?;
+                let stdout = String::from_utf8_lossy(&result.stdout);
+                assert!(
+                    result.status.success(),
+                    "{subcommand:?} {flag}: {}",
+                    String::from_utf8_lossy(&result.stderr)
+                );
+                assert!(stdout.contains(expected), "{subcommand:?} {flag}: {stdout}");
+                assert!(
+                    result.stderr.is_empty(),
+                    "{subcommand:?} {flag}: {result:?}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Verify indexing rejects an absent or empty root list before opening storage or Ollama.
 ///
 /// Returns success for all invalid lists and a successful compact without roots,

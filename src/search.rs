@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -6,76 +6,56 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 
 use crate::config::DatabaseConfig;
-use crate::database::{self, ChunkSource, Result};
+use crate::database::{self, ChunkSource};
 use crate::embeddings::{Embedder, EmbeddingSettings};
-use crate::snapshot;
+use crate::error::Result;
+use crate::snapshot::{self, OpenMode};
 
 #[derive(Serialize)]
 pub(crate) struct SearchHit {
-    pub(crate) path: PathBuf,
+    pub(crate) sources: Vec<SearchSource>,
     pub(crate) line_start: usize,
     pub(crate) line_end: usize,
     pub(crate) section_path: Option<Vec<String>>,
     #[serde(rename = "cosine_distance")]
     pub(crate) distance: f32,
-    pub(crate) text: String,
+    pub(crate) text: Option<String>,
 }
 
-/// Ranked vector candidate with all source metadata owned independently of SQLite.
+/// An indexed source path and its availability at query time.
+#[derive(Serialize)]
+pub(crate) struct SearchSource {
+    pub(crate) path: PathBuf,
+    pub(crate) line_start: usize,
+    pub(crate) line_end: usize,
+    pub(crate) status: SourceStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SourceStatus {
+    Available,
+    Missing,
+    ExcerptUnavailable,
+}
+
+/// Ranked chunk and its source metadata, owned independently of SQLite.
 struct SearchCandidate {
     distance: f32,
-    sources: Vec<ChunkSource>,
-}
-
-/// Owned candidates from one round and the size of the vector snapshot they came from.
-struct CandidateBatch {
-    candidates: Vec<SearchCandidate>,
-    index_size: usize,
-}
-
-/// One source version observed by this query, with its hash computed once.
-struct CachedSource {
-    text: String,
-    content_hash: String,
-}
-
-/// Query-local source snapshots; None entries also cache unreadable or missing files.
-#[derive(Default)]
-struct SourceCache {
-    files: HashMap<PathBuf, Option<CachedSource>>,
-}
-
-impl SourceCache {
-    /// Read and hash `path` on its first access, then reuse that observation.
-    ///
-    /// Returns the cached source text and hash, or None after any read or UTF-8
-    /// decoding failure. Later file changes are observed only by a fresh cache.
-    fn read(&mut self, path: &Path) -> Option<&CachedSource> {
-        self.files
-            .entry(path.to_path_buf())
-            .or_insert_with(|| {
-                fs::read_to_string(path).ok().map(|text| CachedSource {
-                    content_hash: blake3::hash(text.as_bytes()).to_hex().to_string(),
-                    text,
-                })
-            })
-            .as_ref()
-    }
+    chunk: ChunkSource,
 }
 
 /// Search the active vector snapshot and resolve current source excerpts.
 ///
 /// - `query` is the search text passed to the embedder's query formatter.
-/// - `limit` is the maximum result count; zero returns immediately.
+/// - `limit` is the maximum chunk count; zero returns immediately.
 /// - `database` locates SQLite and its vector snapshots.
 /// - `embedder` supplies compatible settings and the query embedding.
 ///
-/// Returns ranked hits whose source contents match their indexed hashes when
-/// first read during this query. All excerpts from one path reuse the same text
-/// and hash, including across retries. Search starts with `limit` candidates and
-/// doubles the request if needed, up to four times `limit` or the index size.
-/// Each round reads vectors and metadata from one snapshot and releases its
-/// transaction before reading Markdown. Returned hits come from the final round.
+/// Returns ranked chunks with their indexed source paths, even when an excerpt
+/// cannot be read. Duplicate files share a hit, and distinct chunks can share
+/// a vector. After releasing the SQLite snapshot, reads each path at most once
+/// and retains at most one excerpt per hit.
 ///
 /// # Errors
 ///
@@ -105,38 +85,17 @@ pub(crate) fn run(
     }
 
     let embedding = embedder.embed_query(&query)?;
-    let max_candidates = limit.saturating_mul(4);
-    let mut candidate_count = limit;
-    let mut cache = SourceCache::default();
-    loop {
-        let batch = collect_candidates(
-            &mut connection,
-            database,
-            settings,
-            &embedding,
-            candidate_count,
-        )?;
-        // Approximate search can reorder results at a higher limit, and publication
-        // can replace the snapshot between rounds. Resolve in the new ranking.
-        let hits = resolve_candidates(batch.candidates, limit, &mut cache)?;
-        let next_count = candidate_count
-            .saturating_mul(2)
-            .min(max_candidates)
-            .min(batch.index_size);
-        if hits.len() == limit || next_count <= candidate_count {
-            return Ok(hits);
-        }
-        candidate_count = next_count;
-    }
+    let candidates = collect_candidates(&mut connection, database, settings, &embedding, limit)?;
+    resolve_hits(&candidates, read_source)
 }
 
 /// Collect ranked candidate metadata from one consistent SQLite/vector snapshot.
 ///
 /// `connection` supplies read transactions, `database` locates snapshot files,
 /// `settings` defines the expected embedding space, `embedding` is the query
-/// vector, and `candidate_count` is the requested number of vector matches.
-/// Returns owned candidates and snapshot size after releasing the vector mapping
-/// and read transaction, or an empty batch when no snapshot is active.
+/// vector, and `limit` bounds the number of chunks collected across vector matches.
+/// Returns owned candidates after releasing the mapping and read transaction,
+/// or an empty list when no snapshot is active.
 /// Retries once if a concurrent publication removes the selected snapshot before opening it.
 ///
 /// # Errors
@@ -147,8 +106,8 @@ fn collect_candidates(
     database: &DatabaseConfig,
     settings: &EmbeddingSettings,
     embedding: &[f32],
-    candidate_count: usize,
-) -> Result<CandidateBatch> {
+    limit: usize,
+) -> Result<Vec<SearchCandidate>> {
     let directory = &database.path;
     let dimensions = settings.dimensions;
     let mut retry_missing = true;
@@ -156,130 +115,136 @@ fn collect_candidates(
         // The file name and chunk metadata must come from the same SQLite snapshot.
         let transaction = connection.transaction()?;
         let Some(active) = database::vector_index(&transaction)? else {
-            return Ok(CandidateBatch {
-                candidates: Vec::new(),
-                index_size: 0,
-            });
+            return Ok(Vec::new());
         };
         let path = snapshot::active_path(directory, &active, settings)?;
-        let index = snapshot::new_index(dimensions)?;
-        if let Err(error) = index.view(snapshot::utf8_path(&path)?) {
-            if retry_missing
-                && path
-                    .metadata()
-                    .is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
-            {
+        let index = match snapshot::open(&path, dimensions, OpenMode::View) {
+            Ok(index) => index,
+            Err(error) if retry_missing && error.is_missing() => {
                 // Indexing may have published a new file and removed this one before view.
                 retry_missing = false;
                 continue;
             }
-            return Err(io::Error::other(format!(
-                "Cannot open active index {}: {error}",
-                path.display()
-            ))
-            .into());
-        }
-        snapshot::validate(&index, dimensions)?;
-
-        let index_size = index.size();
-        let candidates = if index_size == 0 {
-            Vec::new()
-        } else {
-            let matches = index.search(embedding, candidate_count.min(index_size))?;
-            matches
-                .keys
-                .into_iter()
-                .zip(matches.distances)
-                .map(|(key, distance)| {
-                    Ok(SearchCandidate {
-                        distance,
-                        sources: database::chunk_sources(&transaction, key)?,
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?
+            Err(error) => return Err(error.into()),
         };
+
+        let mut candidates = Vec::new();
+        let vector_count = limit.min(index.size());
+        if vector_count > 0 {
+            let matches = index.search(embedding, vector_count)?;
+            for (key, distance) in matches.keys.into_iter().zip(matches.distances) {
+                let remaining = limit - candidates.len();
+                let chunks = database::chunk_sources(&transaction, key, remaining)?;
+                candidates.extend(
+                    chunks
+                        .into_iter()
+                        .map(|chunk| SearchCandidate { distance, chunk }),
+                );
+                if candidates.len() == limit {
+                    break;
+                }
+            }
+        }
         drop(index);
         transaction.commit()?;
-        return Ok(CandidateBatch {
-            candidates,
-            index_size,
-        });
+        return Ok(candidates);
     }
 }
 
-/// Resolve owned `candidates` into at most `limit` ranked, current source excerpts.
+/// Resolve ranked `candidates` by grouping every source occurrence by path.
 ///
-/// Returns one hit per candidate, trying alternate sources in order. This phase
-/// reads and hashes files through the shared query `cache` and holds no SQLite transaction.
+/// `read` hashes each path once and includes its text if any affected hit still
+/// needs an excerpt. Returns hits in candidate order, each with its indexed
+/// paths and at most one verified excerpt. Releases each file's text before
+/// moving on to the next path.
 ///
 /// # Errors
 ///
-/// Returns errors for invalid stored ranges or malformed heading metadata.
-fn resolve_candidates(
-    candidates: Vec<SearchCandidate>,
-    limit: usize,
-    cache: &mut SourceCache,
+/// Returns an error for an invalid stored byte range. Source
+/// read errors are recorded as availability statuses.
+fn resolve_hits(
+    candidates: &[SearchCandidate],
+    mut read: impl FnMut(&Path, bool) -> io::Result<(blake3::Hash, Option<String>)>,
 ) -> Result<Vec<SearchHit>> {
-    let mut hits = Vec::new();
-    for candidate in candidates {
-        if hits.len() == limit {
-            break;
+    let mut by_path = BTreeMap::<&Path, Vec<(usize, usize)>>::new();
+    let mut hits = Vec::with_capacity(candidates.len());
+    for (hit_index, candidate) in candidates.iter().enumerate() {
+        let chunk = &candidate.chunk;
+        let location = chunk.location;
+        let mut sources = Vec::with_capacity(chunk.paths.len());
+        for (source_index, path) in chunk.paths.iter().enumerate() {
+            by_path
+                .entry(path)
+                .or_default()
+                .push((hit_index, source_index));
+            sources.push(SearchSource {
+                path: path.clone(),
+                line_start: location.line_start,
+                line_end: location.line_end,
+                status: SourceStatus::ExcerptUnavailable,
+            });
         }
-        for source in candidate.sources {
-            if let Some(hit) = read_hit(source, candidate.distance, cache)? {
-                hits.push(hit);
-                break;
-            }
+        hits.push(SearchHit {
+            sources,
+            line_start: location.line_start,
+            line_end: location.line_end,
+            section_path: chunk.section_path.clone(),
+            distance: candidate.distance,
+            text: None,
+        });
+    }
+
+    for (path, occurrences) in by_path {
+        let needs_text = occurrences.iter().any(|&(hit, _)| hits[hit].text.is_none());
+        let document = read(path, needs_text).map(|(hash, text)| (hash.to_hex(), text));
+        for (hit_index, source_index) in occurrences {
+            let hit = &mut hits[hit_index];
+            let chunk = &candidates[hit_index].chunk;
+            hit.sources[source_index].status = match &document {
+                Ok((hash, text)) if hash.as_str() == chunk.content_hash => {
+                    if hit.text.is_none()
+                        && let Some(text) = text
+                    {
+                        let location = chunk.location;
+                        let excerpt = text
+                            .get(location.byte_start..location.byte_end)
+                            .ok_or_else(|| {
+                                io::Error::other(format!(
+                                    "Invalid chunk byte range for {}",
+                                    path.display()
+                                ))
+                            })?;
+                        hit.text = Some(excerpt.to_owned());
+                    }
+                    SourceStatus::Available
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                    ) =>
+                {
+                    SourceStatus::Missing
+                }
+                _ => SourceStatus::ExcerptUnavailable,
+            };
         }
     }
     Ok(hits)
 }
 
-/// Resolve `source` at its typed location using `cache` and attach vector `distance`.
+/// Hash the file at `path` and return its UTF-8 text when `needs_text` is true.
 ///
-/// Returns a hit only if the source version first observed by this query has its
-/// indexed content hash. Missing, unreadable, and already-edited files return None;
-/// subsequent changes do not affect other excerpts from that path in this query.
-///
-/// # Errors
-///
-/// Returns an error if the byte range is invalid for the UTF-8 source or the
-/// stored heading path cannot be decoded.
-fn read_hit(
-    source: ChunkSource,
-    distance: f32,
-    cache: &mut SourceCache,
-) -> Result<Option<SearchHit>> {
-    let Some(document) = cache.read(&source.path) else {
-        return Ok(None);
-    };
-    if document.content_hash != source.content_hash {
-        return Ok(None);
+/// Streams the bytes into the hash when only verification is needed. Returns
+/// the hash and optional text, or an error on open, read, or UTF-8 decoding.
+fn read_source(path: &Path, needs_text: bool) -> io::Result<(blake3::Hash, Option<String>)> {
+    if needs_text {
+        let text = fs::read_to_string(path)?;
+        return Ok((blake3::hash(text.as_bytes()), Some(text)));
     }
-
-    let location = source.location;
-    let text = document
-        .text
-        .get(location.byte_start..location.byte_end)
-        .ok_or_else(|| {
-            io::Error::other(format!(
-                "Invalid chunk byte range for {}",
-                source.path.display()
-            ))
-        })?;
-    let section_path = source
-        .section_path
-        .as_deref()
-        .map(serde_json::from_str)
-        .transpose()?;
-    Ok(Some(SearchHit {
-        path: source.path,
-        line_start: location.line_start,
-        line_end: location.line_end,
-        section_path,
-        distance,
-        text: text.to_owned(),
-    }))
+    let mut hash = blake3::Hasher::new();
+    hash.update_reader(fs::File::open(path)?)?;
+    Ok((hash.finalize(), None))
 }
 
 #[cfg(test)]
@@ -308,23 +273,29 @@ mod tests {
         }
     }
 
-    /// Verify search starts at the requested count, expands past stale notes,
-    /// and stops at the candidate budget even if a valid note lies beyond it.
-    /// Indexing and search borrow the same ranking fixture.
-    /// Returns success for all three outcomes or propagates fixture and search errors.
+    /// Verify the limit counts indexed chunks, including hits with no readable excerpt.
+    ///
+    /// Returns success when changed and missing sources retain their ranking and
+    /// duplicate files share a hit. Propagates fixture, indexing, or search errors.
     #[test]
-    fn search_expands_only_as_needed_within_candidate_budget() -> Result<()> {
+    fn search_counts_chunks_with_unavailable_sources() -> Result<()> {
         use std::num::NonZeroUsize;
 
-        let directory = tempfile::tempdir()?;
+        let directory = tempfile::tempdir_in(fs::canonicalize(std::env::temp_dir())?)?;
         let database = DatabaseConfig {
             path: directory.path().to_path_buf(),
         };
-        let notes: Vec<_> = (0..5)
-            .map(|rank| directory.path().join(format!("{rank}.md")))
-            .collect();
-        for (rank, note) in notes.iter().enumerate() {
-            fs::write(note, rank.to_string())?;
+        let changed = directory.path().join("0.md");
+        let missing_copy = directory.path().join("0-copy.md");
+        let missing = directory.path().join("1.md");
+        let available = directory.path().join("2.md");
+        for (path, text) in [
+            (&changed, "0"),
+            (&missing_copy, "0"),
+            (&missing, "1"),
+            (&available, "2"),
+        ] {
+            fs::write(path, text)?;
         }
         let embedder = RankedEmbedder(EmbeddingSettings {
             model: "test-model".into(),
@@ -341,32 +312,23 @@ mod tests {
             &mut |_| {},
         );
         assert!(report.is_success(), "{:?}", report.errors);
-        let mut reader = database::open_read_only(&database.sqlite_path())?;
-        let batch = collect_candidates(
-            &mut reader,
-            &database,
-            embedder.settings(),
-            &[1.0, 0.0, 0.0],
-            1,
-        )?;
-        assert_eq!(batch.index_size, 5);
-        assert_eq!(batch.candidates.len(), 1);
-        let hits = run("query".into(), 1, &database, &embedder)?;
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].text, "0");
+        fs::write(&changed, "Changed.")?;
+        fs::remove_file(&missing_copy)?;
+        fs::remove_file(&missing)?;
 
-        fs::write(&notes[0], "Changed.")?;
-        fs::remove_file(&notes[1])?;
-        let hits = run("query".into(), 1, &database, &embedder)?;
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].text, "2");
-
-        fs::remove_file(&notes[2])?;
-        fs::remove_file(&notes[3])?;
-        assert!(run("query".into(), 1, &database, &embedder)?.is_empty());
         let hits = run("query".into(), 2, &database, &embedder)?;
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].text, "4");
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].text, None);
+        assert_eq!(hits[0].sources.len(), 2);
+        assert_eq!(hits[0].sources[0].path, missing_copy);
+        assert_eq!(hits[0].sources[0].status, SourceStatus::Missing);
+        assert_eq!(hits[0].sources[1].path, changed);
+        assert_eq!(hits[0].sources[1].status, SourceStatus::ExcerptUnavailable);
+        assert_eq!(hits[1].sources[0].path, missing);
+        assert_eq!(hits[1].text, None);
+        let hits = run("query".into(), 3, &database, &embedder)?;
+        assert_eq!(hits[2].text.as_deref(), Some("2"));
+        assert_eq!(hits[2].sources[0].status, SourceStatus::Available);
         Ok(())
     }
 
@@ -438,18 +400,7 @@ mod tests {
         index.add(1, &[1.0_f32, 0.0, 0.0])?;
         snapshot::commit(
             transaction,
-            Some((
-                &index,
-                database::VectorIndex {
-                    format_version: database::VECTOR_INDEX_VERSION,
-                    file_name: String::new(),
-                    model: settings.model.clone(),
-                    model_digest: settings.model_digest.clone(),
-                    dimensions: 3,
-                    chunk_format: None,
-                    removed_since_compact: 0,
-                },
-            )),
+            Some((&index, &settings)),
             &database,
             None,
             &mut |_| {},
@@ -458,22 +409,21 @@ mod tests {
 
         let mut reader = database::open_read_only(&database.sqlite_path())?;
         let candidates =
-            collect_candidates(&mut reader, &database, &settings, &[1.0, 0.0, 0.0], 5)?.candidates;
+            collect_candidates(&mut reader, &database, &settings, &[1.0, 0.0, 0.0], 5)?;
         assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].sources.len(), 2);
+        assert_eq!(candidates[0].chunk.paths.len(), 2);
         assert!(reader.is_autocommit());
 
-        // An exclusive writer would fail immediately if candidate collection retained its lock.
+        // Publish a replacement while the owned candidates still exist.
         let transaction = writer.transaction_with_behavior(TransactionBehavior::Exclusive)?;
-        let mut active = database::vector_index(&transaction)?.unwrap();
+        let active = database::vector_index(&transaction)?.unwrap();
         let previous = snapshot::stored_path(&database.path, &active)?;
         database::delete_document(&transaction, first.to_str().unwrap())?;
         database::delete_document(&transaction, alternate.to_str().unwrap())?;
         let empty = snapshot::new_index(settings.dimensions)?;
-        active.removed_since_compact = 0;
         snapshot::commit(
             transaction,
-            Some((&empty, active)),
+            Some((&empty, &active.settings)),
             &database,
             Some(&previous),
             &mut |_| {},
@@ -482,12 +432,14 @@ mod tests {
         assert!(database::document_sources(&reader)?.is_empty());
 
         fs::write(&first, "Edited after candidate collection.\n")?;
-        let hits = resolve_candidates(candidates, 5, &mut SourceCache::default())?;
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].path, alternate);
-        assert_eq!(hits[0].text, text);
-        assert_eq!(hits[0].section_path, Some(vec!["Original heading".into()]));
-        assert!(hits[0].distance.abs() < 0.0001);
+        let hits = resolve_hits(&candidates, read_source)?;
+        let hit = &hits[0];
+        assert_eq!(hit.sources[0].status, SourceStatus::ExcerptUnavailable);
+        assert_eq!(hit.sources[1].path, alternate);
+        assert_eq!(hit.sources[1].status, SourceStatus::Available);
+        assert_eq!(hit.text.as_deref(), Some(text));
+        assert_eq!(hit.section_path, Some(vec!["Original heading".into()]));
+        assert!(hit.distance.abs() < 0.0001);
         Ok(())
     }
 
@@ -496,135 +448,93 @@ mod tests {
     /// Returns source metadata with the indexed file hash and no heading path.
     fn chunk_source(path: &Path, indexed_text: &str, location: SourceLocation) -> ChunkSource {
         ChunkSource {
-            path: path.to_path_buf(),
+            paths: vec![path.to_path_buf()],
             content_hash: blake3::hash(indexed_text.as_bytes()).to_hex().to_string(),
             section_path: None,
             location,
         }
     }
 
-    /// Verify every excerpt in a query uses the first file version and a new query rereads it.
+    /// Verify that one read resolves multiple chunks and duplicates are only hashed.
     ///
-    /// Returns success for cached Unicode excerpts and stale-file rejection;
-    /// propagates filesystem and candidate-resolution errors.
+    /// Returns success when every hit preserves its original ranking and excerpt,
+    /// and missing or invalid copies keep their indexed ranges. Propagates fixture
+    /// and candidate-resolution errors.
     #[test]
-    fn excerpts_share_one_source_version_until_the_next_query() -> Result<()> {
+    fn reads_each_path_once_and_only_streams_hash_for_extra_copies() -> Result<()> {
         let directory = tempfile::tempdir()?;
-        let path = directory.path().join("note.md");
+        let path = directory.path().join("a.md");
+        let copy = directory.path().join("b.md");
+        let missing = directory.path().join("c.md");
+        let invalid = directory.path().join("d.md");
         let first = "Перший 🙂.\n";
         let second = "Другий рядок.\n";
         let markdown = format!("{first}{second}");
         fs::write(&path, &markdown)?;
-        let mut cache = SourceCache::default();
-        let first_hit = read_hit(
-            chunk_source(
-                &path,
-                &markdown,
-                SourceLocation {
-                    byte_start: 0,
-                    byte_end: first.len(),
-                    line_start: 1,
-                    line_end: 1,
-                },
-            ),
-            0.25,
-            &mut cache,
-        )?
-        .unwrap();
-        assert_eq!(first_hit.text, first);
-
-        fs::write(&path, "Edited after the first excerpt.\n")?;
-        let location = SourceLocation {
-            byte_start: first.len(),
-            byte_end: markdown.len(),
-            line_start: 2,
-            line_end: 2,
-        };
-        let second_hit =
-            read_hit(chunk_source(&path, &markdown, location), 0.5, &mut cache)?.unwrap();
-        assert_eq!(second_hit.text, second);
-        assert_eq!((second_hit.line_start, second_hit.line_end), (2, 2));
-        assert!(
-            read_hit(
-                chunk_source(&path, &markdown, location),
-                0.5,
-                &mut SourceCache::default(),
-            )?
-            .is_none()
-        );
-        Ok(())
-    }
-
-    /// Verify failed reads remain cached until a new query observes newly available text.
-    ///
-    /// Returns success for missing and invalid-UTF-8 sources; propagates fixture and
-    /// candidate-resolution errors.
-    #[test]
-    fn missing_and_unreadable_sources_are_not_retried_in_the_same_query() -> Result<()> {
-        let directory = tempfile::tempdir()?;
-        let missing = directory.path().join("missing.md");
-        let invalid = directory.path().join("invalid.md");
+        fs::write(&copy, &markdown)?;
         fs::write(&invalid, [0xff])?;
-        let markdown = "Available 🙂.\n";
-        let location = SourceLocation {
-            byte_start: 0,
-            byte_end: markdown.len(),
-            line_start: 1,
-            line_end: 1,
-        };
-        let mut cache = SourceCache::default();
-        for path in [&missing, &invalid] {
-            assert!(read_hit(chunk_source(path, markdown, location), 0.25, &mut cache)?.is_none());
-            fs::write(path, markdown)?;
-            assert!(read_hit(chunk_source(path, markdown, location), 0.25, &mut cache)?.is_none());
-            let fresh_hit = read_hit(
-                chunk_source(path, markdown, location),
-                0.25,
-                &mut SourceCache::default(),
-            )?
-            .unwrap();
-            assert_eq!(fresh_hit.text, markdown);
+        let candidates: Vec<_> = [(0, first.len(), 1), (first.len(), markdown.len(), 2)]
+            .into_iter()
+            .map(|(byte_start, byte_end, line)| {
+                let mut chunk = chunk_source(
+                    &path,
+                    &markdown,
+                    SourceLocation {
+                        byte_start,
+                        byte_end,
+                        line_start: line,
+                        line_end: line,
+                    },
+                );
+                chunk
+                    .paths
+                    .extend([copy.clone(), missing.clone(), invalid.clone()]);
+                SearchCandidate {
+                    chunk,
+                    distance: line as f32 * 0.25,
+                }
+            })
+            .collect();
+        let mut reads = Vec::new();
+        let hits = resolve_hits(&candidates, |path, needs_text| {
+            reads.push((path.to_path_buf(), needs_text));
+            read_source(path, needs_text)
+        })?;
+        assert_eq!(
+            reads,
+            [
+                (path, true),
+                (copy, false),
+                (missing, false),
+                (invalid, false)
+            ]
+        );
+        for (index, (hit, excerpt)) in hits.iter().zip([first, second]).enumerate() {
+            assert_eq!(hit.text.as_deref(), Some(excerpt));
+            assert_eq!(hit.distance, candidates[index].distance);
+            assert_eq!(
+                hit.sources
+                    .iter()
+                    .map(|source| source.status)
+                    .collect::<Vec<_>>(),
+                [
+                    SourceStatus::Available,
+                    SourceStatus::Available,
+                    SourceStatus::Missing,
+                    SourceStatus::ExcerptUnavailable,
+                ]
+            );
+            let line = index + 1;
+            assert!(
+                hit.sources
+                    .iter()
+                    .all(|source| (source.line_start, source.line_end) == (line, line))
+            );
         }
         Ok(())
     }
 
-    /// Verify a cached stale path does not hide another path with matching indexed content.
-    ///
-    /// Returns success for stale-source caching and valid duplicate fallback;
-    /// propagates fixture and candidate-resolution errors.
-    #[test]
-    fn stale_source_does_not_poison_other_paths_with_the_same_indexed_hash() -> Result<()> {
-        let directory = tempfile::tempdir()?;
-        let stale = directory.path().join("stale.md");
-        let valid = directory.path().join("valid.md");
-        let markdown = "Shared indexed text.\n";
-        fs::write(&stale, "Changed text.\n")?;
-        fs::write(&valid, markdown)?;
-        let location = SourceLocation {
-            byte_start: 0,
-            byte_end: markdown.len(),
-            line_start: 1,
-            line_end: 1,
-        };
-        let mut cache = SourceCache::default();
-        assert!(read_hit(chunk_source(&stale, markdown, location), 0.25, &mut cache)?.is_none());
-        fs::write(&stale, markdown)?;
-        assert!(read_hit(chunk_source(&stale, markdown, location), 0.25, &mut cache)?.is_none());
-        let hit = read_hit(chunk_source(&valid, markdown, location), 0.25, &mut cache)?.unwrap();
-        assert_eq!(hit.path, valid);
-        assert_eq!(hit.text, markdown);
-        assert!(
-            read_hit(
-                chunk_source(&stale, markdown, location),
-                0.25,
-                &mut SourceCache::default(),
-            )?
-            .is_some()
-        );
-        Ok(())
-    }
-
-    /// Verify cached text preserves exact Unicode byte spans and their line coordinates.
+    /// Verify search preserves exact Unicode byte spans and indexed line coordinates.
     ///
     /// Returns success on the expected hit; propagates filesystem and search errors.
     #[test]
@@ -635,31 +545,33 @@ mod tests {
         let excerpt = "Перший рядок.\nДругий 🙂.\n";
         let markdown = format!("{prefix}{excerpt}\n# Інший розділ\n\nІнший текст.\n");
         fs::write(&path, &markdown)?;
-        let hit = read_hit(
-            ChunkSource {
-                path: path.clone(),
-                content_hash: blake3::hash(markdown.as_bytes()).to_hex().to_string(),
-                section_path: Some(serde_json::to_string(&["Назва 🙂"])?),
-                location: SourceLocation {
-                    byte_start: prefix.len(),
-                    byte_end: prefix.len() + excerpt.len(),
-                    line_start: 3,
-                    line_end: 4,
+        let hits = resolve_hits(
+            &[SearchCandidate {
+                chunk: ChunkSource {
+                    paths: vec![path.clone()],
+                    content_hash: blake3::hash(markdown.as_bytes()).to_hex().to_string(),
+                    section_path: Some(vec!["Назва 🙂".into()]),
+                    location: SourceLocation {
+                        byte_start: prefix.len(),
+                        byte_end: prefix.len() + excerpt.len(),
+                        line_start: 3,
+                        line_end: 4,
+                    },
                 },
-            },
-            0.25,
-            &mut SourceCache::default(),
-        )?
-        .unwrap();
-        assert_eq!(hit.path, path);
-        assert_eq!(hit.text, excerpt);
+                distance: 0.25,
+            }],
+            read_source,
+        )?;
+        let hit = &hits[0];
+        assert_eq!(hit.sources[0].path, path);
+        assert_eq!(hit.text.as_deref(), Some(excerpt));
         assert_eq!((hit.line_start, hit.line_end), (3, 4));
         assert_eq!(hit.section_path, Some(vec!["Назва 🙂".into()]));
         assert_eq!(hit.distance, 0.25);
         Ok(())
     }
 
-    /// Verify cached text still rejects invalid UTF-8 boundaries in typed coordinates.
+    /// Verify search rejects invalid UTF-8 boundaries in stored coordinates.
     ///
     /// Returns success on the expected range error; propagates fixture write errors.
     #[test]
@@ -668,20 +580,22 @@ mod tests {
         let path = directory.path().join("note.md");
         let markdown = "🙂text";
         fs::write(&path, markdown)?;
-        let result = read_hit(
-            ChunkSource {
-                path,
-                content_hash: blake3::hash(markdown.as_bytes()).to_hex().to_string(),
-                section_path: None,
-                location: SourceLocation {
-                    byte_start: 1,
-                    byte_end: 4,
-                    line_start: 1,
-                    line_end: 1,
+        let result = resolve_hits(
+            &[SearchCandidate {
+                chunk: ChunkSource {
+                    paths: vec![path],
+                    content_hash: blake3::hash(markdown.as_bytes()).to_hex().to_string(),
+                    section_path: None,
+                    location: SourceLocation {
+                        byte_start: 1,
+                        byte_end: 4,
+                        line_start: 1,
+                        line_end: 1,
+                    },
                 },
-            },
-            0.25,
-            &mut SourceCache::default(),
+                distance: 0.25,
+            }],
+            read_source,
         );
         assert!(result.is_err());
         Ok(())

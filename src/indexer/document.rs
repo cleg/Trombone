@@ -8,13 +8,12 @@ use std::path::Path;
 use rusqlite::{Connection, Transaction};
 
 use crate::adapter::Document;
-use crate::database::{self, Result};
+use crate::database;
 use crate::embeddings::{Embedder, EmbeddingSettings, format_chunk};
+use crate::error::{Error, Result};
 use crate::index_report::{IndexProgress, IndexStatus};
 use crate::processor;
 use crate::progress::IndexEvent;
-
-type Error = Box<dyn std::error::Error + Send + Sync>;
 
 #[derive(Debug)]
 enum StageError {
@@ -44,7 +43,7 @@ pub(super) fn process_file(
     transaction: &mut Transaction<'_>,
     chunk_size: NonZeroUsize,
     embedder: &dyn Embedder,
-    progress: &IndexProgress<'_>,
+    progress: &mut IndexProgress<'_>,
 ) -> Result<()> {
     progress.file(path);
     // Hash and split the same bytes even if the source changes during embedding.
