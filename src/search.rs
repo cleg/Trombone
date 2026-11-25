@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io;
+use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
@@ -9,6 +10,7 @@ use crate::config::DatabaseConfig;
 use crate::database::{self, ChunkSource};
 use crate::embeddings::{Embedder, EmbeddingSettings};
 use crate::error::Result;
+use crate::processor;
 use crate::snapshot::{self, OpenMode};
 
 #[derive(Serialize)]
@@ -36,6 +38,7 @@ pub(crate) struct SearchSource {
 pub(crate) enum SourceStatus {
     Available,
     Missing,
+    TooLarge,
     ExcerptUnavailable,
 }
 
@@ -49,6 +52,7 @@ struct SearchCandidate {
 ///
 /// - `query` is the search text passed to the embedder's query formatter.
 /// - `limit` is the maximum chunk count; zero returns immediately.
+/// - `max_file_bytes` is the maximum source file size in bytes read for excerpts.
 /// - `database` locates SQLite and its vector snapshots.
 /// - `embedder` supplies compatible settings and the query embedding.
 ///
@@ -62,8 +66,9 @@ struct SearchCandidate {
 /// Returns an error for incompatible settings, embedding failures, invalid stored
 /// metadata, or SQLite and snapshot access failures.
 pub(crate) fn run(
-    query: String,
+    query: &str,
     limit: usize,
+    max_file_bytes: NonZeroU64,
     database: &DatabaseConfig,
     embedder: &dyn Embedder,
 ) -> Result<Vec<SearchHit>> {
@@ -84,10 +89,18 @@ pub(crate) fn run(
         transaction.commit()?;
     }
 
-    let embedding = embedder.embed_query(&query)?;
+    let embedding = embedder.embed_query(query)?;
     let candidates = collect_candidates(&mut connection, database, settings, &embedding, limit)?;
-    resolve_hits(&candidates, read_source)
+    resolve_hits(&candidates, |path, needs_text| {
+        read_source(path, needs_text, max_file_bytes)
+    })
 }
+
+/// Maximum retries when a concurrent publication replaces the active snapshot before `view`.
+///
+/// Two retries (three attempts total) cover back-to-back snapshot swaps such as
+/// `tb index` followed immediately by automatic compaction.
+const MISSING_SNAPSHOT_RETRIES: usize = 2;
 
 /// Collect ranked candidate metadata from one consistent SQLite/vector snapshot.
 ///
@@ -96,7 +109,8 @@ pub(crate) fn run(
 /// vector, and `limit` bounds the number of chunks collected across vector matches.
 /// Returns owned candidates after releasing the mapping and read transaction,
 /// or an empty list when no snapshot is active.
-/// Retries once if a concurrent publication removes the selected snapshot before opening it.
+/// Retries up to [`MISSING_SNAPSHOT_RETRIES`] times if concurrent publications
+/// remove the selected snapshot before opening it.
 ///
 /// # Errors
 ///
@@ -110,7 +124,7 @@ fn collect_candidates(
 ) -> Result<Vec<SearchCandidate>> {
     let directory = &database.path;
     let dimensions = settings.dimensions;
-    let mut retry_missing = true;
+    let mut remaining_retries = MISSING_SNAPSHOT_RETRIES;
     loop {
         // The file name and chunk metadata must come from the same SQLite snapshot.
         let transaction = connection.transaction()?;
@@ -120,9 +134,9 @@ fn collect_candidates(
         let path = snapshot::active_path(directory, &active, settings)?;
         let index = match snapshot::open(&path, dimensions, OpenMode::View) {
             Ok(index) => index,
-            Err(error) if retry_missing && error.is_missing() => {
-                // Indexing may have published a new file and removed this one before view.
-                retry_missing = false;
+            Err(error) if remaining_retries > 0 && error.is_missing() => {
+                // Indexing or automatic compaction may have published a new file and removed this one before view.
+                remaining_retries -= 1;
                 continue;
             }
             Err(error) => return Err(error.into()),
@@ -226,6 +240,7 @@ fn resolve_hits(
                 {
                     SourceStatus::Missing
                 }
+                Err(error) if error.kind() == io::ErrorKind::FileTooLarge => SourceStatus::TooLarge,
                 _ => SourceStatus::ExcerptUnavailable,
             };
         }
@@ -235,15 +250,28 @@ fn resolve_hits(
 
 /// Hash the file at `path` and return its UTF-8 text when `needs_text` is true.
 ///
-/// Streams the bytes into the hash when only verification is needed. Returns
-/// the hash and optional text, or an error on open, read, or UTF-8 decoding.
-fn read_source(path: &Path, needs_text: bool) -> io::Result<(blake3::Hash, Option<String>)> {
+/// Enforces `max_file_bytes` before loading text or hashing so oversized files
+/// consistently report [`io::ErrorKind::FileTooLarge`]. Streams the bytes into
+/// the hash when only verification is needed. Returns the hash and optional
+/// text, or an error on open, read, size limit, or UTF-8 decoding.
+fn read_source(
+    path: &Path,
+    needs_text: bool,
+    max_file_bytes: NonZeroU64,
+) -> io::Result<(blake3::Hash, Option<String>)> {
     if needs_text {
-        let text = fs::read_to_string(path)?;
+        let text = processor::read_source_file(path, max_file_bytes)?;
         return Ok((blake3::hash(text.as_bytes()), Some(text)));
     }
+    let file = fs::File::open(path)?;
+    if file.metadata()?.len() > max_file_bytes.get() {
+        return Err(io::Error::new(
+            io::ErrorKind::FileTooLarge,
+            format!("File exceeds maximum size of {max_file_bytes} bytes"),
+        ));
+    }
     let mut hash = blake3::Hasher::new();
-    hash.update_reader(fs::File::open(path)?)?;
+    hash.update_reader(file)?;
     Ok((hash.finalize(), None))
 }
 
@@ -306,6 +334,7 @@ mod tests {
         let report = crate::indexer::run(
             &[directory.path().to_path_buf()],
             NonZeroUsize::new(1_000).unwrap(),
+            crate::config::DEFAULT_MAX_FILE_BYTES,
             false,
             &database,
             &embedder,
@@ -316,7 +345,13 @@ mod tests {
         fs::remove_file(&missing_copy)?;
         fs::remove_file(&missing)?;
 
-        let hits = run("query".into(), 2, &database, &embedder)?;
+        let hits = run(
+            "query",
+            2,
+            crate::config::DEFAULT_MAX_FILE_BYTES,
+            &database,
+            &embedder,
+        )?;
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].text, None);
         assert_eq!(hits[0].sources.len(), 2);
@@ -326,7 +361,13 @@ mod tests {
         assert_eq!(hits[0].sources[1].status, SourceStatus::ExcerptUnavailable);
         assert_eq!(hits[1].sources[0].path, missing);
         assert_eq!(hits[1].text, None);
-        let hits = run("query".into(), 3, &database, &embedder)?;
+        let hits = run(
+            "query",
+            3,
+            crate::config::DEFAULT_MAX_FILE_BYTES,
+            &database,
+            &embedder,
+        )?;
         assert_eq!(hits[2].text.as_deref(), Some("2"));
         assert_eq!(hits[2].sources[0].status, SourceStatus::Available);
         Ok(())
@@ -432,7 +473,9 @@ mod tests {
         assert!(database::document_sources(&reader)?.is_empty());
 
         fs::write(&first, "Edited after candidate collection.\n")?;
-        let hits = resolve_hits(&candidates, read_source)?;
+        let hits = resolve_hits(&candidates, |path, needs_text| {
+            read_source(path, needs_text, crate::config::DEFAULT_MAX_FILE_BYTES)
+        })?;
         let hit = &hits[0];
         assert_eq!(hit.sources[0].status, SourceStatus::ExcerptUnavailable);
         assert_eq!(hit.sources[1].path, alternate);
@@ -498,7 +541,7 @@ mod tests {
         let mut reads = Vec::new();
         let hits = resolve_hits(&candidates, |path, needs_text| {
             reads.push((path.to_path_buf(), needs_text));
-            read_source(path, needs_text)
+            read_source(path, needs_text, crate::config::DEFAULT_MAX_FILE_BYTES)
         })?;
         assert_eq!(
             reads,
@@ -560,7 +603,7 @@ mod tests {
                 },
                 distance: 0.25,
             }],
-            read_source,
+            |path, needs_text| read_source(path, needs_text, crate::config::DEFAULT_MAX_FILE_BYTES),
         )?;
         let hit = &hits[0];
         assert_eq!(hit.sources[0].path, path);
@@ -595,9 +638,61 @@ mod tests {
                 },
                 distance: 0.25,
             }],
-            read_source,
+            |path, needs_text| read_source(path, needs_text, crate::config::DEFAULT_MAX_FILE_BYTES),
         );
         assert!(result.is_err());
+        Ok(())
+    }
+
+    /// Verify oversized files are skipped with a warning during indexing and marked TooLarge in search.
+    ///
+    /// Returns success when indexing publishes without errors after skipping an
+    /// oversized file and search reports `SourceStatus::TooLarge` for an indexed
+    /// file that later exceeds `max_file_bytes`. Propagates fixture or search errors.
+    #[test]
+    fn oversized_files_warn_on_index_and_report_too_large_on_search() -> Result<()> {
+        use std::num::NonZeroUsize;
+
+        let directory = tempfile::tempdir_in(fs::canonicalize(std::env::temp_dir())?)?;
+        let database = DatabaseConfig {
+            path: directory.path().to_path_buf(),
+        };
+        let small = directory.path().join("0.md");
+        let oversized = directory.path().join("1.md");
+        fs::write(&small, "0")?;
+        fs::write(&oversized, "0123456789")?;
+        let embedder = RankedEmbedder(EmbeddingSettings {
+            model: "test-model".into(),
+            model_digest: "a".repeat(64),
+            dimensions: NonZeroUsize::new(3).unwrap(),
+            chunk_format: None,
+        });
+        let limit = NonZeroU64::new(5).unwrap();
+        let mut warned = Vec::new();
+        let report = crate::indexer::run(
+            &[directory.path().to_path_buf()],
+            NonZeroUsize::new(1_000).unwrap(),
+            limit,
+            false,
+            &database,
+            &embedder,
+            &mut |event| {
+                if let crate::progress::ProgressEvent::FileTooLarge { path, .. } = event {
+                    warned.push(path.to_path_buf());
+                }
+            },
+        );
+        assert!(report.is_success(), "{:?}", report.errors);
+        assert_eq!(report.committed.indexed, 1);
+        assert_eq!(warned, [oversized]);
+
+        // Grow the indexed file beyond the limit and verify search reports TooLarge.
+        fs::write(&small, "0123456789")?;
+        let hits = run("query", 5, limit, &database, &embedder)?;
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].text, None);
+        assert_eq!(hits[0].sources[0].path, small);
+        assert_eq!(hits[0].sources[0].status, SourceStatus::TooLarge);
         Ok(())
     }
 }

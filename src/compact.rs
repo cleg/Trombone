@@ -57,6 +57,8 @@ pub(crate) fn run_if_due(
 /// Rebuild the committed graph in `database` under an independent writer lock.
 ///
 /// `only_if_due` enables the automatic threshold. `emit` receives progress.
+/// Drops unreferenced rows from `embeddings` in the same transaction so future
+/// indexing cannot reuse keys removed from the compacted snapshot.
 /// Returns committed counts, or `None` if no rebuild was needed.
 ///
 /// # Errors
@@ -90,6 +92,9 @@ fn run_with_policy(
 
     let keys = database::live_vector_keys(&transaction)?;
     let rebuilt = rebuild(&source, &keys, dimensions)?;
+    // Drop unreferenced embedding metadata in the same transaction so future
+    // indexing cannot reuse a vector key that compaction removed from USearch.
+    database::delete_unreferenced_embeddings(&transaction)?;
     let report = CompactReport {
         previous_vectors: source.size(),
         retained_vectors: rebuilt.size(),
@@ -281,6 +286,9 @@ mod tests {
         database::delete_document(&connection, "a.md")?;
         database::delete_document(&connection, "b.md")?;
         assert_eq!(run(&database, &mut |_| {})?.unwrap().retained_vectors, 0);
+        let remaining_embeddings: i64 =
+            connection.query_row("SELECT COUNT(*) FROM embeddings", [], |row| row.get(0))?;
+        assert_eq!(remaining_embeddings, 0);
         Ok(())
     }
 }

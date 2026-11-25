@@ -1,8 +1,7 @@
 //! Stages a Markdown document and its new embeddings in a SQLite savepoint.
 
-use std::fs;
 use std::io;
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::Path;
 
 use rusqlite::{Connection, Transaction};
@@ -13,7 +12,7 @@ use crate::embeddings::{Embedder, EmbeddingSettings, format_chunk};
 use crate::error::{Error, Result};
 use crate::index_report::{IndexProgress, IndexStatus};
 use crate::processor;
-use crate::progress::IndexEvent;
+use crate::progress::{IndexEvent, ProgressEvent};
 
 #[derive(Debug)]
 enum StageError {
@@ -30,10 +29,12 @@ enum StageOutcome {
     RolledBack(Error),
 }
 
-/// Read and stage the discovered source `path` using `chunk_size` and `embedder`.
+/// Read and stage the discovered source `path` using `chunk_size`, `max_file_bytes`, and `embedder`.
 ///
-/// `transaction` owns the file savepoint. `progress` records success or a
-/// recoverable read or processing error. Returns success after either outcome.
+/// `transaction` owns the file savepoint. `progress` records success, emits a
+/// nonfatal warning when the file exceeds `max_file_bytes` and skips it, or
+/// records a recoverable read or processing error. Returns success after any of
+/// these outcomes.
 ///
 /// # Errors
 ///
@@ -42,13 +43,21 @@ pub(super) fn process_file(
     path: &Path,
     transaction: &mut Transaction<'_>,
     chunk_size: NonZeroUsize,
+    max_file_bytes: NonZeroU64,
     embedder: &dyn Embedder,
     progress: &mut IndexProgress<'_>,
 ) -> Result<()> {
     progress.file(path);
     // Hash and split the same bytes even if the source changes during embedding.
-    let source = match fs::read_to_string(path) {
+    let source = match processor::read_source_file(path, max_file_bytes) {
         Ok(source) => source,
+        Err(error) if error.kind() == io::ErrorKind::FileTooLarge => {
+            progress.emit(ProgressEvent::FileTooLarge {
+                path,
+                max_bytes: max_file_bytes,
+            });
+            return Ok(());
+        }
         Err(error) => {
             progress.issue(Some(path), &error);
             return Ok(());
@@ -88,6 +97,8 @@ pub(super) fn process_file(
 ///
 /// Returns Staged after releasing the file savepoint, or RolledBack with the
 /// original file error after restoring its rows, including staged vectors.
+/// Rejects vectors whose length differs from `settings.dimensions` or that
+/// contain non-finite floats as recoverable processing errors.
 ///
 /// # Errors
 ///
@@ -120,6 +131,15 @@ fn stage_file(
                         settings.dimensions,
                         vector.len()
                     ))
+                    .into(),
+                ));
+            }
+            if vector.iter().any(|value| !value.is_finite()) {
+                return Err(StageError::Processing(
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Embedding vector contains a non-finite value",
+                    )
                     .into(),
                 ));
             }

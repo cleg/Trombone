@@ -400,6 +400,8 @@ pub(crate) fn live_vector_count(connection: &Connection) -> Result<usize> {
 ///
 /// `path` identifies the database. `:memory:` opens an in-memory database using
 /// SQLite's memory journal. Returns a writable connection with foreign keys enabled.
+/// Skips writer-lock acquisition during startup when the schema is already current
+/// and WAL mode is already enabled.
 ///
 /// # Errors
 ///
@@ -410,15 +412,19 @@ pub(crate) fn open(path: &Path) -> Result<Connection> {
     connection.pragma_update(None, "foreign_keys", true)?;
     initialize(&mut connection)?;
     if path != Path::new(":memory:") {
-        // Validate the schema first and change journal mode outside its transaction.
-        let mode: String =
-            connection.pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get(0))?;
-        if !mode.eq_ignore_ascii_case("wal") {
-            return Err(io::Error::other(format!(
-                "Could not enable WAL for {} (SQLite reported journal mode {mode})",
-                path.display(),
-            ))
-            .into());
+        let current: String =
+            connection.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
+        if !current.eq_ignore_ascii_case("wal") {
+            // Validate the schema first and change journal mode outside its transaction.
+            let mode: String =
+                connection.pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get(0))?;
+            if !mode.eq_ignore_ascii_case("wal") {
+                return Err(io::Error::other(format!(
+                    "Could not enable WAL for {} (SQLite reported journal mode {mode})",
+                    path.display(),
+                ))
+                .into());
+            }
         }
     }
     Ok(connection)
@@ -463,15 +469,24 @@ pub(crate) fn open_read_only(path: &Path) -> Result<Connection> {
 
 /// Initialize a new database or accept the exact supported schema version.
 ///
-/// `connection` is the writable database connection. Returns success after
-/// creating a fresh schema atomically or accepting an existing current schema.
-/// Existing databases are never migrated, including empty older schemas.
+/// `connection` is the writable database connection. Fast-paths already-versioned
+/// databases without acquiring a writer lock. For uninitialized databases
+/// (`user_version == 0`), acquires an immediate transaction and creates a fresh
+/// schema atomically. Existing databases are never migrated, including empty
+/// older schemas.
 ///
 /// # Errors
 ///
 /// Returns an error for an occupied writer lock, incompatible versions, or
 /// SQLite initialization failures.
 fn initialize(connection: &mut Connection) -> Result<()> {
+    let version = database_version(connection)?;
+    if version == DATABASE_VERSION {
+        return Ok(());
+    }
+    if version != 0 {
+        return check_database_version(connection);
+    }
     let transaction = begin_write(connection)?;
     let version = database_version(&transaction)?;
     let has_tables: bool = transaction.query_row(
@@ -599,6 +614,19 @@ pub(crate) fn delete_embedding(connection: &Connection, key: u64) -> Result<()> 
         );
     }
     Ok(())
+}
+
+/// Delete all embedding rows in `connection` that are no longer referenced by any chunk.
+///
+/// Returns the number of deleted rows, or a SQLite error if the deletion fails.
+pub(crate) fn delete_unreferenced_embeddings(connection: &Connection) -> Result<usize> {
+    Ok(connection.execute(
+        "DELETE FROM embeddings
+         WHERE NOT EXISTS (
+             SELECT 1 FROM chunks WHERE chunks.vector_key = embeddings.vector_key
+         )",
+        [],
+    )?)
 }
 
 /// Insert metadata for one `chunk` into the caller's `connection` transaction.

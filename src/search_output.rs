@@ -90,6 +90,9 @@ impl<W: Write> SearchOutput for ConsoleOutput<W> {
                         lines,
                     ),
                     SourceStatus::Missing => (AnsiColor::Red, " [missing]".into(), separator),
+                    SourceStatus::TooLarge => {
+                        (AnsiColor::Yellow, " [too large]".into(), separator)
+                    }
                     SourceStatus::ExcerptUnavailable => {
                         (AnsiColor::Yellow, " [no excerpt]".into(), separator)
                     }
@@ -118,11 +121,13 @@ impl<W: Write> SearchOutput for ConsoleOutput<W> {
                 )?;
             }
             if let Some(section_path) = &hit.section_path {
-                writeln!(self.writer, "{}", section_path.join(" > "))?;
+                let heading = sanitize_inline(&section_path.join(" > "));
+                writeln!(self.writer, "{heading}")?;
             }
             if let Some(text) = &hit.text {
-                self.writer.write_all(text.as_bytes())?;
-                if !text.ends_with('\n') {
+                let sanitized = sanitize_multiline(text);
+                self.writer.write_all(sanitized.as_bytes())?;
+                if !sanitized.ends_with('\n') {
                     writeln!(self.writer)?;
                 }
             } else {
@@ -131,6 +136,37 @@ impl<W: Write> SearchOutput for ConsoleOutput<W> {
         }
         self.writer.flush()
     }
+}
+
+/// Return whether `character` is a control character or Unicode line separator.
+fn is_line_control(character: char) -> bool {
+    character.is_control() || matches!(character, '\u{2028}' | '\u{2029}')
+}
+
+/// Replace control characters and Unicode line separators in single-line `text`.
+fn sanitize_inline(text: &str) -> String {
+    text.replace(is_line_control, "\u{FFFD}")
+}
+
+/// Sanitize multiline `text` for terminal display while preserving newlines and tabs.
+///
+/// Normalizes CRLF pairs to LF and replaces standalone CR, ANSI escape bytes,
+/// other control characters, and Unicode line separators with U+FFFD.
+fn sanitize_multiline(text: &str) -> String {
+    let mut sanitized = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(character) = chars.next() {
+        match character {
+            '\n' | '\t' => sanitized.push(character),
+            '\r' if chars.peek() == Some(&'\n') => {
+                chars.next();
+                sanitized.push('\n');
+            }
+            c if is_line_control(c) => sanitized.push('\u{FFFD}'),
+            c => sanitized.push(c),
+        }
+    }
+    sanitized
 }
 
 /// Render `path` in one line, preserving its filename when the full path does
@@ -217,6 +253,40 @@ mod tests {
         assert_eq!(console::strip_ansi_codes(rows[6]), "(+1 more files)");
         assert_eq!(rows[7], "Chunk text.");
         assert!(!rendered.contains("hidden.md"));
+        Ok(())
+    }
+
+    /// Verify console output neutralizes control and ANSI escape sequences in headings and text.
+    ///
+    /// Returns success when escapes are replaced while tabs, LF, and CRLF are preserved;
+    /// propagates output or UTF-8 decoding errors.
+    #[test]
+    fn console_output_sanitizes_control_characters_in_headings_and_excerpts()
+    -> crate::error::Result<()> {
+        let mut output = ConsoleOutput {
+            writer: Vec::new(),
+            color: false,
+            columns: None,
+        };
+        output.write_results(&[SearchHit {
+            sources: vec![SearchSource {
+                path: PathBuf::from("note.md"),
+                line_start: 1,
+                line_end: 2,
+                status: SourceStatus::Available,
+            }],
+            line_start: 1,
+            line_end: 2,
+            section_path: Some(vec!["Root\x1b[31m".into(), "Sub\u{2028}Title".into()]),
+            distance: 0.1,
+            text: Some("Line\t1\r\n\x1b[31mred\rLine 2".into()),
+        }])?;
+        let rendered = String::from_utf8(output.writer)?;
+        assert!(!rendered.contains('\x1b'));
+        assert!(!rendered.contains('\u{2028}'));
+        assert!(!rendered.contains('\r'));
+        assert!(rendered.contains("Root\u{FFFD}[31m > Sub\u{FFFD}Title\n"));
+        assert!(rendered.contains("Line\t1\n\u{FFFD}[31mred\u{FFFD}Line 2\n"));
         Ok(())
     }
 }

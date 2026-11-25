@@ -18,11 +18,17 @@ pub(crate) fn default_path() -> io::Result<PathBuf> {
     Ok(home.join(".config/trombone/trombone.toml"))
 }
 
+/// Default maximum source file size read into memory (50 MiB).
+pub(crate) const DEFAULT_MAX_FILE_BYTES: NonZeroU64 = NonZeroU64::new(50 * 1024 * 1024).unwrap();
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Config {
     #[serde(default)]
     roots: Vec<PathBuf>,
+    /// Maximum source file size in bytes that indexing and search will read into memory.
+    #[serde(default = "default_max_file_bytes")]
+    pub(crate) max_file_bytes: NonZeroU64,
     pub(crate) ollama: OllamaConfig,
     pub(crate) database: DatabaseConfig,
     #[serde(default)]
@@ -75,6 +81,11 @@ impl Default for ChunkingConfig {
 
 fn default_ollama_url() -> String {
     "http://localhost:11434".to_owned()
+}
+
+/// Return the nonzero default maximum source file size (50 MiB).
+fn default_max_file_bytes() -> NonZeroU64 {
+    DEFAULT_MAX_FILE_BYTES
 }
 
 /// Return the nonzero default Ollama connection timeout of ten seconds.

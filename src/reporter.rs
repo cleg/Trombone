@@ -47,6 +47,13 @@ impl Reporter {
                     IndexEvent::Issue(issue) => self.issue(issue),
                 }
             }
+            ProgressEvent::FileTooLarge { path, max_bytes } => {
+                self.error(format_args!(
+                    "Warning: skipping {} (exceeds max_file_bytes limit of {} bytes)",
+                    path_label(path),
+                    max_bytes,
+                ));
+            }
             // Standalone compaction prints its summary and warnings only.
             ProgressEvent::SavingSnapshot if self.indexing => self.stage("Saving USearch snapshot"),
             ProgressEvent::Committing if self.indexing => self.stage("Committing SQLite"),
@@ -301,7 +308,7 @@ fn path_label(path: &Path) -> String {
     path.to_string_lossy()
         .chars()
         .map(|character| {
-            if character.is_control() {
+            if character.is_control() || matches!(character, '\u{2028}' | '\u{2029}') {
                 '�'
             } else {
                 character

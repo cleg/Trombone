@@ -1,6 +1,7 @@
 //! Operation events shared by the indexing core and its callers.
 
 use std::fmt::Display;
+use std::num::NonZeroU64;
 use std::path::Path;
 
 use crate::index_report::{IndexCounts, IndexIssue, IndexStatus};
@@ -12,6 +13,10 @@ pub(crate) enum ProgressEvent<'a> {
         seen: usize,
         staged: IndexCounts,
         errors: usize,
+    },
+    FileTooLarge {
+        path: &'a Path,
+        max_bytes: NonZeroU64,
     },
     SavingSnapshot,
     Committing,

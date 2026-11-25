@@ -71,7 +71,15 @@ fn check_automatic_compaction(holes: u64, surplus: u64) -> Result<()> {
     let active = database::vector_index(&connection)?.unwrap();
     let previous = snapshot::stored_path(&database.path, &active)?;
 
-    let deferred = run(&roots, chunk_size, true, &database, &embedder, &mut |_| {});
+    let deferred = run(
+        &roots,
+        chunk_size,
+        crate::config::DEFAULT_MAX_FILE_BYTES,
+        true,
+        &database,
+        &embedder,
+        &mut |_| {},
+    );
     assert!(deferred.is_success(), "{:?}", deferred.errors);
     assert_eq!(
         deferred.publication,
@@ -94,6 +102,7 @@ fn check_automatic_compaction(holes: u64, surplus: u64) -> Result<()> {
     let report = run(
         &roots,
         chunk_size,
+        crate::config::DEFAULT_MAX_FILE_BYTES,
         false,
         &database,
         &embedder,
@@ -121,7 +130,15 @@ fn check_automatic_compaction(holes: u64, surplus: u64) -> Result<()> {
     assert_eq!(after.file_name, active.file_name);
     connection.execute_batch("DROP TRIGGER fail_compaction")?;
 
-    let rebuilt = run(&roots, chunk_size, false, &database, &embedder, &mut |_| {});
+    let rebuilt = run(
+        &roots,
+        chunk_size,
+        crate::config::DEFAULT_MAX_FILE_BYTES,
+        false,
+        &database,
+        &embedder,
+        &mut |_| {},
+    );
     assert!(rebuilt.is_success(), "{:?}", rebuilt.errors);
     assert_eq!(
         rebuilt.publication,

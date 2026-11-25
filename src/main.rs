@@ -84,6 +84,7 @@ fn main() -> ExitCode {
             let report = indexer::run(
                 roots,
                 chunk_size.unwrap_or(config.chunking.size),
+                config.max_file_bytes,
                 no_compact,
                 &config.database,
                 &embedder,
@@ -113,7 +114,14 @@ fn main() -> ExitCode {
                 Ok(embedder) => embedder,
                 Err(status) => return status,
             };
-            let result = search::run(query, limit, &config.database, &embedder).and_then(|hits| {
+            let result = search::run(
+                &query,
+                limit,
+                config.max_file_bytes,
+                &config.database,
+                &embedder,
+            )
+            .and_then(|hits| {
                 let stdout = std::io::stdout().lock();
                 match output {
                     OutputFormat::Console => ConsoleOutput::new(stdout).write_results(&hits),

@@ -490,6 +490,7 @@ mod tests {
                     warnings.push(path.to_path_buf());
                 }
                 ProgressEvent::Index { .. }
+                | ProgressEvent::FileTooLarge { .. }
                 | ProgressEvent::Compacting
                 | ProgressEvent::AutomaticCompactionFailed(_) => unreachable!(),
             },

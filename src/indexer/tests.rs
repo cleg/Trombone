@@ -102,6 +102,7 @@ fn index_roots(
     run(
         roots,
         NonZeroUsize::new(1_000).unwrap(),
+        crate::config::DEFAULT_MAX_FILE_BYTES,
         false,
         database,
         embedder,
@@ -127,6 +128,7 @@ fn one_writer_per_database_allows_parallel_search() -> Result<()> {
     let report = run(
         &[directory.path().to_path_buf()],
         NonZeroUsize::new(1_000).unwrap(),
+        crate::config::DEFAULT_MAX_FILE_BYTES,
         false,
         &database,
         &embedder,
@@ -145,6 +147,7 @@ fn one_writer_per_database_allows_parallel_search() -> Result<()> {
             let competing = run(
                 &[directory.path().to_path_buf()],
                 NonZeroUsize::new(1_000).unwrap(),
+                crate::config::DEFAULT_MAX_FILE_BYTES,
                 false,
                 &database,
                 &embedder,
@@ -174,8 +177,14 @@ fn one_writer_per_database_allows_parallel_search() -> Result<()> {
                     .is_none()
             );
 
-            let hits = crate::search::run("query".into(), 1, &database, &embedder)
-                .expect("the published index remains searchable during indexing");
+            let hits = crate::search::run(
+                "query",
+                1,
+                crate::config::DEFAULT_MAX_FILE_BYTES,
+                &database,
+                &embedder,
+            )
+            .expect("the published index remains searchable during indexing");
             assert_eq!(hits.len(), 1);
             assert_eq!(hits[0].text.as_deref(), Some(text));
         },
@@ -224,7 +233,13 @@ fn prepared_input_hash_reuses_vectors_across_edits_and_files() -> Result<()> {
     assert_eq!(embedder.calls.get(), 2);
     assert_eq!(database::chunk_sources(&reader, key, usize::MAX)?.len(), 2);
     assert_eq!(database::live_vector_count(&reader)?, 2);
-    let hits = crate::search::run("query".into(), 3, &database, &embedder)?;
+    let hits = crate::search::run(
+        "query",
+        3,
+        crate::config::DEFAULT_MAX_FILE_BYTES,
+        &database,
+        &embedder,
+    )?;
     assert_eq!(hits.len(), 3);
     assert_eq!(
         hits.iter()
@@ -239,7 +254,13 @@ fn prepared_input_hash_reuses_vectors_across_edits_and_files() -> Result<()> {
     fs::remove_file(&a)?;
     assert!(index(directory.path(), &database, &embedder).is_success());
     assert_eq!(database::embedding_key(&reader, &shared_hash)?, Some(key));
-    let hits = crate::search::run("query".into(), 5, &database, &embedder)?;
+    let hits = crate::search::run(
+        "query",
+        5,
+        crate::config::DEFAULT_MAX_FILE_BYTES,
+        &database,
+        &embedder,
+    )?;
     assert_eq!(
         hits.iter()
             .filter(|hit| hit.text.as_deref() == Some("Shared paragraph.\n"))
@@ -279,6 +300,7 @@ fn chunk_size_mismatch_aborts_once_before_visiting_files() -> Result<()> {
         let report = run(
             &[root.to_path_buf()],
             NonZeroUsize::new(500).unwrap(),
+            crate::config::DEFAULT_MAX_FILE_BYTES,
             false,
             &database,
             &embedder,
@@ -496,6 +518,7 @@ fn publication_failure_returns_an_unpublished_report() -> Result<()> {
     let report = run(
         &[new_root],
         NonZeroUsize::new(1_000).unwrap(),
+        crate::config::DEFAULT_MAX_FILE_BYTES,
         false,
         &database,
         &embedder,

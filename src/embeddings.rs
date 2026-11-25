@@ -72,8 +72,9 @@ impl OllamaEmbedder {
         let http_client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(config.connect_timeout_secs.get()))
             .build()?;
+        let url = normalize_base_url(&config.url)?;
         let client = Ollama::builder()
-            .url(reqwest::Url::parse(&config.url)?)
+            .url(url)
             .reqwest_client(http_client.clone())
             .build();
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -177,6 +178,33 @@ struct AvailableModels {
     models: Vec<AvailableModel>,
 }
 
+/// Parse `raw_url` as an Ollama base URL with a trailing path slash.
+///
+/// Ensuring the path ends with `/` lets relative endpoints resolve beneath
+/// reverse-proxy path prefixes as well as root URLs.
+///
+/// # Errors
+///
+/// Returns an error if `raw_url` cannot be parsed as a URL.
+fn normalize_base_url(raw_url: &str) -> Result<reqwest::Url> {
+    let mut url = reqwest::Url::parse(raw_url)?;
+    if !url.path().ends_with('/') {
+        url.set_path(&format!("{}/", url.path()));
+    }
+    Ok(url)
+}
+
+/// Build the Ollama `/api/tags` endpoint URL from `base_url`.
+///
+/// Preserves any path prefix configured on `base_url`.
+///
+/// # Errors
+///
+/// Returns an error if `base_url` is invalid or cannot be joined with `api/tags`.
+fn tags_url(base_url: &str) -> Result<reqwest::Url> {
+    Ok(normalize_base_url(base_url)?.join("api/tags")?)
+}
+
 /// Resolve `model` through `client`'s server using the shared `http_client`.
 ///
 /// Runs on `runtime` with the specified `timeout`. Returns the normalized
@@ -192,9 +220,10 @@ fn resolve_model_digest(
     client: &Ollama,
     model: &str,
 ) -> Result<String> {
+    let url = tags_url(client.url_str())?;
     request_with_timeout(runtime, timeout, "model metadata lookup", async {
         let available: AvailableModels = http_client
-            .get(format!("{}api/tags", client.url_str()))
+            .get(url)
             .send()
             .await?
             .error_for_status()?
@@ -328,8 +357,9 @@ fn render_format(
 
 /// Validate a single-input response from `model` against `expected` dimensions.
 ///
-/// `embeddings` contains all returned vectors. Returns exactly one vector, or an
-/// invalid-data error if the response cardinality or vector length differs.
+/// `embeddings` contains all returned vectors. Returns exactly one vector with
+/// all finite components, or an invalid-data error if the response cardinality,
+/// vector length, or float values are invalid.
 fn validate_response(
     embeddings: Vec<Vec<f32>>,
     model: &str,
@@ -346,6 +376,13 @@ fn validate_response(
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("Model {model} returned {actual} dimensions, expected {expected}"),
+        )
+        .into());
+    }
+    if embedding.iter().any(|value| !value.is_finite()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Model {model} returned a non-finite embedding value"),
         )
         .into());
     }
@@ -470,7 +507,7 @@ mod tests {
         assert!(format_query(Some("{text}"), "query").is_err());
     }
 
-    /// Verify the embedding boundary rejects wrong response counts and dimensions.
+    /// Verify the embedding boundary rejects wrong response counts, dimensions, and non-finite values.
     ///
     /// Returns success for expected validation outcomes; propagates valid-response errors.
     #[test]
@@ -479,9 +516,42 @@ mod tests {
         assert!(validate_response(vec![], "model", dimensions).is_err());
         assert!(validate_response(vec![vec![1.0; 3], vec![1.0; 3]], "model", dimensions).is_err());
         assert!(validate_response(vec![vec![1.0; 2]], "model", dimensions).is_err());
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let error =
+                validate_response(vec![vec![1.0, bad, 0.0]], "model", dimensions).unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<io::Error>().unwrap().kind(),
+                io::ErrorKind::InvalidData,
+            );
+        }
         assert_eq!(
             validate_response(vec![vec![1.0, 0.0, 0.0]], "model", dimensions)?,
             [1.0, 0.0, 0.0],
+        );
+        Ok(())
+    }
+
+    /// Verify Ollama endpoint URLs preserve reverse-proxy path prefixes with or without a trailing slash.
+    ///
+    /// Returns success when every base URL resolves to the expected `/api/tags` endpoint,
+    /// or propagates URL parsing errors.
+    #[test]
+    fn tags_url_preserves_base_path_prefixes() -> Result<()> {
+        assert_eq!(
+            tags_url("http://localhost:11434")?.as_str(),
+            "http://localhost:11434/api/tags",
+        );
+        assert_eq!(
+            tags_url("http://localhost:11434/")?.as_str(),
+            "http://localhost:11434/api/tags",
+        );
+        assert_eq!(
+            tags_url("http://localhost:11434/ollama")?.as_str(),
+            "http://localhost:11434/ollama/api/tags",
+        );
+        assert_eq!(
+            tags_url("http://localhost:11434/ollama/")?.as_str(),
+            "http://localhost:11434/ollama/api/tags",
         );
         Ok(())
     }
@@ -538,19 +608,38 @@ mod tests {
         };
         let roots = [directory.path().to_path_buf()];
         let chunk_size = NonZeroUsize::new(1_000).unwrap();
+        let max_file_bytes = crate::config::DEFAULT_MAX_FILE_BYTES;
         assert!(
-            indexer::run(&roots, chunk_size, false, &database, &embedder, &mut |_| {}).is_success()
+            indexer::run(
+                &roots,
+                chunk_size,
+                max_file_bytes,
+                false,
+                &database,
+                &embedder,
+                &mut |_| {}
+            )
+            .is_success()
         );
         assert_eq!(
             *embedder.chunks.borrow(),
             [format!("title: Корінь 🙂 | text: {body}")]
         );
         assert!(
-            indexer::run(&roots, chunk_size, false, &database, &embedder, &mut |_| {}).is_success()
+            indexer::run(
+                &roots,
+                chunk_size,
+                max_file_bytes,
+                false,
+                &database,
+                &embedder,
+                &mut |_| {}
+            )
+            .is_success()
         );
         assert_eq!(embedder.chunks.borrow().len(), 1);
 
-        let hits = search::run("raw query".into(), 5, &database, &embedder)?;
+        let hits = search::run("raw query", 5, max_file_bytes, &database, &embedder)?;
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].text.as_deref(), Some(body));
         assert_eq!(hits[0].line_start, 3);
@@ -563,7 +652,7 @@ mod tests {
 
         let digest = embedder.settings.model_digest.clone();
         embedder.settings.model_digest = "b".repeat(64);
-        let error = search::run("changed digest".into(), 5, &database, &embedder)
+        let error = search::run("changed digest", 5, max_file_bytes, &database, &embedder)
             .err()
             .unwrap();
         assert!(error.to_string().contains("digest differs"));
@@ -571,7 +660,15 @@ mod tests {
             &note,
             "New content that must not be embedded with the replacement model.",
         )?;
-        let report = indexer::run(&roots, chunk_size, false, &database, &embedder, &mut |_| {});
+        let report = indexer::run(
+            &roots,
+            chunk_size,
+            max_file_bytes,
+            false,
+            &database,
+            &embedder,
+            &mut |_| {},
+        );
         assert!(!report.is_success());
         assert_eq!(
             report.publication,
@@ -591,10 +688,18 @@ mod tests {
 
         embedder.settings.model_digest = digest;
         embedder.settings.model = "another-model".into();
-        assert!(search::run("incompatible".into(), 5, &database, &embedder).is_err());
+        assert!(search::run("incompatible", 5, max_file_bytes, &database, &embedder).is_err());
         assert!(
-            !indexer::run(&roots, chunk_size, false, &database, &embedder, &mut |_| {})
-                .is_success()
+            !indexer::run(
+                &roots,
+                chunk_size,
+                max_file_bytes,
+                false,
+                &database,
+                &embedder,
+                &mut |_| {}
+            )
+            .is_success()
         );
         assert_eq!(embedder.chunks.borrow().len(), 1);
         assert_eq!(embedder.queries.borrow().len(), 1);

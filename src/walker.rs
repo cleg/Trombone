@@ -41,8 +41,8 @@ pub(crate) fn walk(
         let entries = fs::read_dir(&path)?;
         Ok((path, entries))
     });
-    let mut stack = match opened {
-        Ok(opened) => vec![opened],
+    let (root_path, root_entries) = match opened {
+        Ok(opened) => opened,
         Err(error) => {
             emit(WalkEvent::Issue {
                 path: root,
@@ -51,6 +51,8 @@ pub(crate) fn walk(
             return Ok(WalkOutcome::Unopened);
         }
     };
+    let mut visited = HashSet::from([root_path.clone()]);
+    let mut stack = vec![(root_path, root_entries)];
     let mut outcome = WalkOutcome::Complete;
     while let Some((directory, entries)) = stack.last_mut() {
         let Some(entry) = entries.next() else {
@@ -83,7 +85,7 @@ pub(crate) fn walk(
 
         if kind.is_file() {
             emit(WalkEvent::File(&path))?;
-        } else if !stack.iter().any(|(ancestor, _)| ancestor == &path) {
+        } else if visited.insert(path.clone()) {
             match fs::read_dir(&path) {
                 Ok(entries) => stack.push((path, entries)),
                 Err(error) => {
@@ -134,11 +136,21 @@ fn source_entry(entry: &DirEntry) -> io::Result<Option<(PathBuf, FileType)>> {
 
 /// Confirm that following the named symlink at `path` repeats a link.
 ///
-/// Called after target lookup fails. Returns false when a link or its parent
-/// cannot be resolved, including chains that merely exceed the OS hop limit.
+/// Called after target lookup fails. Detects both direct link cycles and
+/// indirect cycles through symlinked parent directories. Returns false when a
+/// link or its parent is dangling or cannot be resolved, including chains that
+/// merely exceed the OS hop limit.
 fn is_symlink_loop(path: &Path) -> bool {
-    let mut path = path.to_path_buf();
     let mut seen = HashSet::new();
+    is_symlink_loop_with_seen(path, &mut seen)
+}
+
+/// Follow symlink targets starting at `path`, recording visited links in `seen`.
+///
+/// Returns true if any link in the chain (or an unresolvable symlinked ancestor
+/// of a target's parent) repeats an entry in `seen`, and false otherwise.
+fn is_symlink_loop_with_seen(path: &Path, seen: &mut HashSet<PathBuf>) -> bool {
+    let mut path = path.to_path_buf();
     while seen.insert(path.clone()) {
         let Ok(target) = fs::read_link(&path) else {
             return false;
@@ -147,10 +159,68 @@ fn is_symlink_loop(path: &Path) -> bool {
         let (Some(parent), Some(name)) = (target.parent(), target.file_name()) else {
             return false;
         };
-        let Ok(parent) = fs::canonicalize(parent) else {
-            return false;
+        let parent = match fs::canonicalize(parent) {
+            Ok(parent) => parent,
+            Err(_) => return has_looping_symlink_ancestor(parent, seen),
         };
         path = parent.join(name);
     }
     true
+}
+
+/// Check whether `path` or one of its ancestors is a symlink involved in a cycle.
+///
+/// Uses `seen` to recognize cycles back to links already being traced. Returns
+/// true if a cyclic symlink ancestor is confirmed, or false for dangling links
+/// and other resolution failures.
+fn has_looping_symlink_ancestor(path: &Path, seen: &mut HashSet<PathBuf>) -> bool {
+    for ancestor in path.ancestors() {
+        let Ok(metadata) = fs::symlink_metadata(ancestor) else {
+            continue;
+        };
+        if metadata.file_type().is_symlink() {
+            return is_symlink_loop_with_seen(ancestor, seen);
+        }
+        break;
+    }
+    false
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::os::unix::fs::symlink;
+
+    use super::*;
+
+    /// Verify symlink DAGs visit shared directories once and indirect loops complete cleanly.
+    ///
+    /// Returns success when duplicate directory routes emit the shared file once
+    /// and an indirect symlink loop (`a -> b/c`, `b -> a`) is skipped without
+    /// downgrading the walk to partial. Propagates fixture and walker errors.
+    #[test]
+    fn deduplicates_symlink_dags_and_skips_indirect_symlink_loops() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let shared = directory.path().join("shared");
+        fs::create_dir(&shared)?;
+        let note = shared.join("note.md");
+        fs::write(&note, "hello")?;
+        symlink(&shared, directory.path().join("alias1"))?;
+        symlink(&shared, directory.path().join("alias2"))?;
+        symlink("b/c", directory.path().join("a"))?;
+        symlink("a", directory.path().join("b"))?;
+
+        let mut files = Vec::new();
+        let mut issues = Vec::new();
+        let outcome = walk(directory.path(), |event| {
+            match event {
+                WalkEvent::File(path) => files.push(path.to_path_buf()),
+                WalkEvent::Issue { path, error } => issues.push((path.to_path_buf(), error.kind())),
+            }
+            Ok(())
+        })?;
+        assert!(matches!(outcome, WalkOutcome::Complete), "{issues:?}");
+        assert!(issues.is_empty(), "{issues:?}");
+        assert_eq!(files, [fs::canonicalize(&note)?]);
+        Ok(())
+    }
 }

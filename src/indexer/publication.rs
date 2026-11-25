@@ -71,6 +71,11 @@ pub(super) fn publish_index(
             None => snapshot::new_index(dimensions)?,
         };
 
+        for key in removed {
+            if index.remove(key)? != 1 {
+                return Err(io::Error::other(format!("Could not remove vector {key}")).into());
+            }
+        }
         let capacity = index
             .size()
             .checked_add(staged)
@@ -82,11 +87,6 @@ pub(super) fn publish_index(
             index.add(key, vector)?;
             Ok(())
         })?;
-        for key in removed {
-            if index.remove(key)? != 1 {
-                return Err(io::Error::other(format!("Could not remove vector {key}")).into());
-            }
-        }
         Some(index)
     } else {
         None

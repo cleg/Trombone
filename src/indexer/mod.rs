@@ -8,7 +8,7 @@
 mod document;
 mod publication;
 
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::PathBuf;
 
 use crate::compact;
@@ -30,6 +30,7 @@ use self::publication::publish_index;
 ///
 /// - `roots` is the validated list of configured source directories.
 /// - `chunk_size` is the maximum chunk length in Unicode characters.
+/// - `max_file_bytes` is the maximum source file size in bytes read into memory.
 /// - `no_compact` skips automatic rebuilding for this pass.
 /// - `database` provides the SQLite and snapshot location.
 /// - `embedder` supplies model settings and generates chunk embeddings.
@@ -43,6 +44,7 @@ use self::publication::publish_index;
 pub(crate) fn run(
     roots: &[PathBuf],
     chunk_size: NonZeroUsize,
+    max_file_bytes: NonZeroU64,
     no_compact: bool,
     database: &DatabaseConfig,
     embedder: &dyn Embedder,
@@ -54,7 +56,14 @@ pub(crate) fn run(
         return progress.finish(PublicationStatus::NotPublished);
     }
     progress.notify(IndexEvent::Opening(&database.path));
-    let mut publication = match execute(roots, chunk_size, database, embedder, &mut progress) {
+    let mut publication = match execute(
+        roots,
+        chunk_size,
+        max_file_bytes,
+        database,
+        embedder,
+        &mut progress,
+    ) {
         Ok(publication) => publication,
         Err(error) => {
             progress.issue(None, error.as_ref());
@@ -82,7 +91,8 @@ pub(crate) fn run(
 /// Coordinate preparation, traversal, deletion reconciliation, and publication.
 ///
 /// `roots` defines the desired documents for the database. `chunk_size` limits
-/// chunk length in Unicode characters.
+/// chunk length in Unicode characters, and `max_file_bytes` caps each source
+/// file read into memory.
 /// `database` locates storage, `embedder` supplies model settings and chunk
 /// embeddings, and `progress` records counters, deletion deferral, and events.
 /// Returns the publication outcome. Recoverable errors allow traversal to
@@ -99,6 +109,7 @@ pub(crate) fn run(
 fn execute(
     roots: &[PathBuf],
     chunk_size: NonZeroUsize,
+    max_file_bytes: NonZeroU64,
     database: &DatabaseConfig,
     embedder: &dyn Embedder,
     progress: &mut IndexProgress<'_>,
@@ -137,7 +148,14 @@ fn execute(
             match event {
                 WalkEvent::File(path) => {
                     if database::mark_source_seen(&transaction, path)? {
-                        process_file(path, &mut transaction, chunk_size, embedder, progress)?;
+                        process_file(
+                            path,
+                            &mut transaction,
+                            chunk_size,
+                            max_file_bytes,
+                            embedder,
+                            progress,
+                        )?;
                     }
                 }
                 WalkEvent::Issue { path, error } => progress.issue(Some(path), error),
