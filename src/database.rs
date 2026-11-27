@@ -669,6 +669,24 @@ pub(crate) fn insert_chunk(
     Ok(())
 }
 
+/// Clear index content and settings in the caller's write `transaction`.
+/// Returns whether a published vector snapshot was detached, or a SQLite error.
+pub(crate) fn clear_index(transaction: &Transaction<'_>) -> Result<bool> {
+    transaction.execute_batch(
+        "DELETE FROM chunks;
+         DELETE FROM documents;
+         DELETE FROM embeddings;
+         DELETE FROM index_config;",
+    )?;
+    Ok(transaction.execute("DELETE FROM vector_index", [])? != 0)
+}
+
+/// Read the data version on `connection` to detect commits by other connections.
+/// Returns the connection-local version counter, or a SQLite error.
+pub(crate) fn data_version(connection: &Connection) -> Result<i64> {
+    Ok(connection.pragma_query_value(None, "data_version", |row| row.get(0))?)
+}
+
 /// Validate and stage `chunk_size` once in the pass's `transaction` before traversal.
 ///
 /// Returns success when the size matches a nonempty index or is adopted by an
@@ -694,7 +712,7 @@ pub(crate) fn ensure_chunk_size(transaction: &Connection, chunk_size: NonZeroUsi
         })?;
     if has_documents && stored_size != Some(chunk_size) {
         return Err(io::Error::other(
-            "Chunk size differs from the existing index; use its chunk size or a new database path",
+            "Chunk size differs from the existing index; use its chunk size or rebuild with tb index --full",
         )
         .into());
     }

@@ -31,7 +31,7 @@ use search_output::{ConsoleOutput, JsonOutput, SearchOutput};
 ///
 /// Returns success after a complete operation, or failure after reporting a
 /// configuration, indexing, compaction, search, or output error. Indexing forwards
-/// its automatic-compaction preference and derives the exit code from IndexReport.
+/// the rebuild and compaction flags and derives the exit code from IndexReport.
 /// The report can include published work alongside recoverable errors. Indexing
 /// validates its root list before initializing embeddings or opening storage.
 /// Indexing and search initialize the embedding client before entering their core operations.
@@ -68,6 +68,7 @@ fn main() -> ExitCode {
         }
         Commands::Index {
             chunk_size,
+            full,
             no_compact,
         } => {
             let roots = match config.index_roots() {
@@ -85,7 +86,7 @@ fn main() -> ExitCode {
                 roots,
                 chunk_size.unwrap_or(config.chunking.size),
                 config.max_file_bytes,
-                no_compact,
+                indexer::IndexOptions { full, no_compact },
                 &config.database,
                 &embedder,
                 &mut |event| reporter.handle(event),

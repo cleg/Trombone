@@ -2,8 +2,10 @@ use std::io;
 use std::num::NonZeroUsize;
 use std::ops::Range;
 use std::path::Path;
+use std::vec::IntoIter;
 
 use pulldown_cmark::{Event, HeadingLevel, OffsetIter, Options, Parser, Tag};
+use text_splitter::{Characters, ChunkConfig, TextSplitter};
 
 use crate::adapter::{Adapter, Attributes, Chunk, Document, DocumentMetadata, SourceLocation};
 
@@ -34,12 +36,11 @@ struct MarkdownChunks<'a> {
     block_start: usize,
     metadata: bool,
     heading: Option<(HeadingLevel, String)>,
-    // An oversized block is consumed a piece at a time, without queuing its chunks.
-    remaining: Option<Range<usize>>,
     finished: bool,
 }
 
 impl<'a> MarkdownChunks<'a> {
+    /// Create an iterator over `source` with a positive character `limit` per chunk.
     fn new(source: &'a str, limit: usize) -> Self {
         assert!(limit > 0, "chunk size must be nonzero");
         let options = Options::ENABLE_TABLES
@@ -52,7 +53,6 @@ impl<'a> MarkdownChunks<'a> {
             block_start: 0,
             metadata: false,
             heading: None,
-            remaining: None,
             finished: false,
         }
     }
@@ -68,13 +68,9 @@ impl Iterator for MarkdownChunks<'_> {
         }
         loop {
             // Finish the current block before advancing the parser or heading path.
-            if let Some(mut range) = self.remaining.take() {
-                let chunk = self.builder.push(&mut range);
-                if !range.is_empty() {
-                    self.remaining = Some(range);
-                }
-                if chunk.is_some() {
-                    return chunk;
+            if let Some(range) = self.builder.split_ranges.next() {
+                if let Some(chunk) = self.builder.emit(range) {
+                    return Some(chunk);
                 }
                 continue;
             }
@@ -107,8 +103,10 @@ impl Iterator for MarkdownChunks<'_> {
                         if let Some((level, text)) = self.heading.take() {
                             self.builder.headings.retain(|(parent, _)| *parent < level);
                             self.builder.headings.push((level, text));
-                        } else if !self.metadata {
-                            self.remaining = Some(self.block_start..range.end);
+                        } else if !self.metadata
+                            && let Some(chunk) = self.builder.push(self.block_start..range.end)
+                        {
+                            return Some(chunk);
                         }
                     }
                 }
@@ -123,8 +121,10 @@ impl Iterator for MarkdownChunks<'_> {
                     }
                 }
                 Event::Rule | Event::Html(_) => {
-                    if self.depth == 0 {
-                        self.remaining = Some(range);
+                    if self.depth == 0
+                        && let Some(chunk) = self.builder.push(range)
+                    {
+                        return Some(chunk);
                     }
                 }
                 // The enclosing block's source range already includes these tokens.
@@ -139,6 +139,8 @@ impl Iterator for MarkdownChunks<'_> {
 struct ChunkBuilder<'a> {
     source: &'a str,
     limit: usize,
+    splitter: TextSplitter<Characters>,
+    split_ranges: IntoIter<Range<usize>>,
     headings: Vec<(HeadingLevel, String)>,
     pending: Option<Range<usize>>,
     pending_chars: usize,
@@ -148,10 +150,13 @@ struct ChunkBuilder<'a> {
 }
 
 impl<'a> ChunkBuilder<'a> {
+    /// Create a builder for spans in `source` with up to `limit` Unicode characters per chunk.
     fn new(source: &'a str, limit: usize) -> Self {
         Self {
             source,
             limit,
+            splitter: TextSplitter::new(ChunkConfig::new(limit).with_trim(false)),
+            split_ranges: Vec::new().into_iter(),
             headings: Vec::new(),
             pending: None,
             pending_chars: 0,
@@ -160,8 +165,11 @@ impl<'a> ChunkBuilder<'a> {
         }
     }
 
-    /// Consume some or all of range and return at most one completed chunk.
-    fn push(&mut self, range: &mut Range<usize>) -> Option<Chunk> {
+    /// Add the next block's source `range` after draining any earlier split ranges.
+    ///
+    /// Returns the previous chunk if the block cannot fit alongside it. Buffers
+    /// the new block or its split ranges for subsequent iteration.
+    fn push(&mut self, range: Range<usize>) -> Option<Chunk> {
         if let Some(pending) = &self.pending {
             // Include the gap, but stop counting as soon as it cannot fit.
             let available = self.limit - self.pending_chars;
@@ -172,42 +180,48 @@ impl<'a> ChunkBuilder<'a> {
             if added_chars <= available {
                 self.pending = Some(pending.start..range.end);
                 self.pending_chars += added_chars;
-                range.start = range.end;
                 return None;
             }
-            // Leave range untouched so the next call can start the new chunk.
-            if let Some(chunk) = self.flush() {
-                return Some(chunk);
-            }
         }
 
-        // Split only one piece, retaining the remaining source range for next().
-        if let Some((cut, _)) = self.source[range.clone()].char_indices().nth(self.limit) {
-            let prefix = &self.source[range.start..range.start + cut];
-            let boundary = prefix
-                .rfind(char::is_whitespace)
-                .map(|offset| offset + prefix[offset..].chars().next().unwrap().len_utf8())
-                .filter(|offset| prefix[..*offset].chars().count() >= self.limit / 2)
-                .unwrap_or(cut);
-            let end = range.start + boundary;
-            self.pending = Some(range.start..end);
-            range.start = end;
-            return self.flush();
+        let previous = self.flush();
+        let text = &self.source[range.clone()];
+        let chars = text.chars().take(self.limit.saturating_add(1)).count();
+        if chars <= self.limit {
+            self.pending = Some(range);
+            self.pending_chars = chars;
+        } else {
+            // Queue only source ranges. Keep the last piece pending so it can
+            // still combine with the next block if both fit within the limit.
+            let mut ranges: Vec<_> = self
+                .splitter
+                .chunk_indices(text)
+                .map(|(offset, chunk)| {
+                    let start = range.start + offset;
+                    start..start + chunk.len()
+                })
+                .collect();
+            self.pending = ranges.pop();
+            self.pending_chars = self
+                .pending
+                .as_ref()
+                .map_or(0, |span| self.source[span.clone()].chars().count());
+            self.split_ranges = ranges.into_iter();
         }
-
-        self.pending_chars = self.source[range.clone()].chars().count();
-        self.pending = Some(range.clone());
-        range.start = range.end;
-        None
+        previous
     }
 
-    /// Emit this builder's pending source span with typed byte and line coordinates.
-    ///
-    /// Returns a chunk and advances the line cursor, or `None` if there is no
-    /// pending span or it contains only whitespace.
+    /// Consume the pending span and return its chunk, if it contains non-whitespace text.
     fn flush(&mut self) -> Option<Chunk> {
         self.pending_chars = 0;
         let range = self.pending.take()?;
+        self.emit(range)
+    }
+
+    /// Return a chunk for the source `range` and advance the line cursor.
+    ///
+    /// Returns `None` for an empty or whitespace-only span and leaves the cursor unchanged.
+    fn emit(&mut self, range: Range<usize>) -> Option<Chunk> {
         let text = &self.source[range.clone()];
         if text.trim().is_empty() {
             return None;
@@ -291,18 +305,36 @@ mod tests {
         }
     }
 
-    /// Verify oversized blocks retain a remainder after each typed source span is emitted.
+    /// Verify oversized blocks preserve their text and finish before the next heading.
     #[test]
     fn oversized_blocks_leave_their_remainder_for_the_next_call() {
-        let source = format!("```\n{}\n```\n\n# Later\n", "🙂text ".repeat(10_000));
-        let mut chunks = MarkdownChunks::new(&source, 20);
-        let first = chunks.next().unwrap();
-        let remainder = chunks.remaining.as_ref().unwrap();
-        assert_eq!(remainder.start, first.location.byte_end);
-        assert!(remainder.len() > source.len() / 2);
-        assert!(chunks.builder.pending.is_none());
-        assert!(!chunks.finished);
-        assert_source_ranges(&source, &[first, chunks.next().unwrap()], 20);
+        let block = format!("```\n{}\n```", "🙂text ".repeat(10_000));
+        let source = format!("{block}\n\n# Later\n\nNext.\n");
+        let chunks = chunk_markdown(&source, 20);
+        let (last, code_chunks) = chunks.split_last().unwrap();
+        assert_source_ranges(&source, &chunks, 20);
+        assert!(code_chunks.iter().all(|chunk| chunk.section_path.is_none()));
+        assert_eq!(
+            code_chunks
+                .iter()
+                .map(|chunk| chunk.text.as_str())
+                .collect::<String>(),
+            block
+        );
+        assert_eq!(last.section_path, Some(vec!["Later".into()]));
+        assert_eq!(last.text, "Next.\n");
+    }
+
+    /// Verify that an oversized paragraph splits at sentence boundaries within the limit.
+    #[test]
+    fn oversized_paragraph_prefers_sentence_boundaries() {
+        let first = "Перше коротке речення. ";
+        let second = "Друге речення довше.";
+        let source = format!("{first}{second}");
+        let chunks = chunk_markdown(&source, 30);
+        assert_source_ranges(&source, &chunks, 30);
+        let texts: Vec<_> = chunks.iter().map(|chunk| chunk.text.as_str()).collect();
+        assert_eq!(texts, [first, second]);
     }
 
     /// Verify section ancestry and typed line coordinates across headings and fenced code.
@@ -381,13 +413,11 @@ mod tests {
     #[test]
     fn crlf_across_chunk_boundary_counts_as_one_line_break() {
         let mut builder = ChunkBuilder::new("A\r\nB", 2);
-        let mut remaining = 0..4;
-        let first = builder.push(&mut remaining).unwrap();
+        let first = builder.emit(0..2).unwrap();
         assert_eq!(first.text, "A\r");
         assert_eq!((first.location.line_start, first.location.line_end), (1, 1));
 
-        assert!(builder.push(&mut remaining).is_none());
-        let second = builder.flush().unwrap();
+        let second = builder.emit(2..4).unwrap();
         assert_eq!(second.text, "\nB");
         assert_eq!(
             (second.location.line_start, second.location.line_end),

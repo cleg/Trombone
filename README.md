@@ -1,3 +1,5 @@
+![A fluffy black cat playing a rusty trombone](banner.jpg)
+
 # Trombone
 
 Trombone is a Rust CLI for building a local semantic index of Markdown notes. The `tb` binary splits notes into chunks, generates embeddings through Ollama, and stores chunk metadata in SQLite and vectors in USearch.
@@ -20,6 +22,8 @@ cargo build --locked
 
 `--chunk-size` overrides `[chunking].size` for the pass. In a terminal, indexing shows live counts, the current file and chunk, and the save and commit stages. When output is redirected, for example through `tee`, it streams plain-text progress lines. The final counts report committed changes.
 
+`tb index --full` clears the existing index before scanning the configured roots. It regenerates embeddings for all indexed content and accepts new model or chunking settings. The reset is committed before scanning, so search has no active index during the rebuild. If the rebuild fails before publication, the index stays empty. Source files and configuration remain in place.
+
 Only one `tb index` or `tb compact` can write to a given database at a time.
 A command that encounters an occupied writer lock exits with a busy message.
 `tb index` checks the Ollama model before attempting to acquire the lock.
@@ -35,9 +39,9 @@ Cleanup failures are reported as warnings.
 
 The final summary explicitly states whether the pass was published, whether its vector snapshot changed, and whether automatic compaction ran. It includes indexed, reused, unchanged, and removed document counts, attempted file count, and error count. With a fatal error, committed counts are zero and any prepared work is reported separately. A pass with recoverable errors can publish its successful changes but still exits with a failure status.
 
-Without `--config`, `tb` reads `~/.config/trombone/trombone.toml`. Set `[database].path` to an existing directory. Relative paths in `database.path` and `roots` resolve against the directory containing the real config file after following symlinks. Indexing requires at least one directory path and rejects empty paths before opening SQLite or initializing Ollama. Search and compaction can use an existing database without `roots`. Trombone stores `trombone.sqlite` and `trombone-index-*.usearch` inside that directory. Set `[ollama].model` and `expected_dimensions` together when choosing a model, and use a fresh database directory when changing the model or chunk size for an existing index.
+Without `--config`, `tb` reads `~/.config/trombone/trombone.toml`. Set `[database].path` to an existing directory. Relative paths in `database.path` and `roots` resolve against the directory containing the real config file after following symlinks. Indexing requires at least one directory path and rejects empty paths before opening SQLite or initializing Ollama. Search and compaction can use an existing database without `roots`. Trombone stores `trombone.sqlite` and `trombone-index-*.usearch` inside that directory. Set `[ollama].model` and `expected_dimensions` together when choosing a model. Run `tb index --full` after changing the model or chunk size for an existing index.
 
-Indexes built when Markdown headings were included in chunk text require a rebuild. Point `[database].path` at a fresh directory and run `tb index` on your notes.
+Run `tb index --full` to apply sentence-aware Markdown chunking to previously indexed files. Ordinary indexing skips files whose content is unchanged.
 
 Ollama calls allow 10 seconds to connect and 120 seconds for a complete request,
 including response decoding. Override these positive integer limits with
@@ -55,9 +59,9 @@ query_format = "task: search result | query: {query}"
 
 The chunk template requires `{text}` and can use `{title}` for the heading path (or `none` if there is no heading). The query template requires `{query}`. Use `{{` and `}}` for literal braces. Omit the templates to use the heading path followed by the chunk body, and the raw search query.
 
-Changing `chunk_format` requires a fresh database directory and a new indexing run. Changing only `query_format` takes effect on the next search.
+After changing `chunk_format`, rebuild with `tb index --full`. Changing only `query_format` takes effect on the next search.
 
-At the start of indexing or search, Trombone reads the selected model's digest from [Ollama's model list](https://docs.ollama.com/api/tags). The digest is stored with the active snapshot and must match on subsequent commands, even when the model name and dimensions are unchanged. A mismatch stops the command before generating embeddings; restore the indexed model or rebuild in a fresh database directory. Missing models or unavailable digest metadata at startup are errors.
+At the start of indexing or search, Trombone reads the selected model's digest from [Ollama's model list](https://docs.ollama.com/api/tags). Incremental indexing and search require the digest stored with the active snapshot to match, even when the model name and dimensions are unchanged. On a mismatch, restore the indexed model or rebuild with `tb index --full`. Missing models or unavailable digest metadata at startup are errors.
 
 Trombone checks the digest again after publication, including when some files failed to index. If it changed, the command prints a warning on stderr and keeps the published result, the startup digest, and its exit status. The final lookup is silent if it fails or the digest matches. Search only checks at startup, and `compact` preserves the stored digest without contacting Ollama.
 

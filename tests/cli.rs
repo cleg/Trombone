@@ -32,6 +32,9 @@ fn help_and_version_work_without_a_usable_config() -> io::Result<()> {
                     String::from_utf8_lossy(&result.stderr)
                 );
                 assert!(stdout.contains(expected), "{subcommand:?} {flag}: {stdout}");
+                if subcommand == Some("index") && flag == "--help" {
+                    assert!(stdout.contains("--full"), "{stdout}");
+                }
                 assert!(
                     result.stderr.is_empty(),
                     "{subcommand:?} {flag}: {result:?}"
@@ -56,7 +59,7 @@ fn indexing_requires_roots_but_compaction_does_not() -> io::Result<()> {
         let result = Command::new(env!("CARGO_BIN_EXE_tb"))
             .arg("--config")
             .arg(&config)
-            .args(["index", "--chunk-size", "1000", "--no-compact"])
+            .args(["index", "--full", "--chunk-size", "1000", "--no-compact"])
             .output()?;
         let error = String::from_utf8_lossy(&result.stderr);
         assert!(!result.status.success());

@@ -31,6 +31,7 @@ pub(crate) enum ProgressEvent<'a> {
 /// Indexing activity and diagnostics with no console formatting.
 pub(crate) enum IndexEvent<'a> {
     Opening(&'a Path),
+    Cleared,
     Scanning(&'a Path),
     File(&'a Path),
     Embedding { path: &'a Path, chunk: usize },

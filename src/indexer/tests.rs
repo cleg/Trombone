@@ -6,7 +6,7 @@ use std::io;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
-use super::run;
+use super::{IndexOptions, run};
 use crate::compact;
 use crate::config::DatabaseConfig;
 use crate::database;
@@ -103,11 +103,142 @@ fn index_roots(
         roots,
         NonZeroUsize::new(1_000).unwrap(),
         crate::config::DEFAULT_MAX_FILE_BYTES,
-        false,
+        IndexOptions::default(),
         database,
         embedder,
         &mut |_| {},
     )
+}
+
+/// Verify a full pass clears the active index before scanning and embeds unchanged files anew.
+/// Returns success or propagates fixture and storage errors.
+#[test]
+fn full_rebuild_clears_index_before_scanning() -> Result<()> {
+    let (directory, database) = corpus()?;
+    let root = directory.path().to_path_buf();
+    fs::write(root.join("note.md"), "Unchanged body.\n")?;
+    let unrelated = root.join("keep.txt");
+    fs::write(&unrelated, "keep")?;
+    let embedder = test_embedder(None, None);
+    assert!(index(&root, &database, &embedder).is_success());
+    let reader = database::open_read_only(&database.sqlite_path())?;
+    let old = database::vector_index(&reader)?.unwrap();
+    let old_path = snapshot::stored_path(&root, &old)?;
+
+    let mut new_embedder = test_embedder(None, None);
+    new_embedder.settings.model_digest = "b".repeat(64);
+    let mut saw_empty = false;
+    let report = run(
+        &[root],
+        NonZeroUsize::new(100).unwrap(),
+        crate::config::DEFAULT_MAX_FILE_BYTES,
+        IndexOptions {
+            full: true,
+            no_compact: true,
+        },
+        &database,
+        &new_embedder,
+        &mut |event| {
+            if let ProgressEvent::Index {
+                event: IndexEvent::Scanning(_),
+                ..
+            } = event
+            {
+                assert!(database::vector_index(&reader).unwrap().is_none());
+                assert!(!old_path.exists());
+                saw_empty = true;
+            }
+        },
+    );
+    assert!(report.is_success(), "{:?}", report.errors);
+    assert!(saw_empty);
+    assert_eq!(report.committed.indexed, 1);
+    assert_eq!(report.committed.unchanged, 0);
+    assert_eq!(new_embedder.calls.get(), 1);
+    let active = database::vector_index(&reader)?.unwrap();
+    assert_eq!(
+        active.settings.model_digest,
+        new_embedder.settings.model_digest
+    );
+    assert_ne!(active.file_name, old.file_name);
+    assert_eq!(fs::read_to_string(unrelated)?, "keep");
+    Ok(())
+}
+
+/// Verify a full pass with unavailable roots leaves an empty index after the reset.
+/// Returns success or propagates fixture and storage errors.
+#[test]
+fn failed_full_rebuild_keeps_the_reset() -> Result<()> {
+    let (directory, database) = corpus()?;
+    fs::write(directory.path().join("note.md"), "Old content.")?;
+    let embedder = test_embedder(None, None);
+    assert!(index(directory.path(), &database, &embedder).is_success());
+    let reader = database::open_read_only(&database.sqlite_path())?;
+    let old = database::vector_index(&reader)?.unwrap();
+    let old_path = snapshot::stored_path(directory.path(), &old)?;
+    let report = run(
+        &[directory.path().join("unavailable")],
+        NonZeroUsize::new(1_000).unwrap(),
+        crate::config::DEFAULT_MAX_FILE_BYTES,
+        IndexOptions {
+            full: true,
+            ..Default::default()
+        },
+        &database,
+        &embedder,
+        &mut |_| {},
+    );
+    assert!(matches!(
+        report.publication,
+        PublicationStatus::NotPublished
+    ));
+    assert!(database::vector_index(&reader)?.is_none());
+    assert!(database::live_vector_keys(&reader)?.is_empty());
+    assert!(!old_path.exists());
+    Ok(())
+}
+
+/// Verify a writer that publishes after the reset keeps its index and stops the full pass.
+/// Returns success or propagates fixture and storage errors.
+#[test]
+fn full_rebuild_detects_a_write_after_reset() -> Result<()> {
+    let (directory, database) = corpus()?;
+    let root = directory.path().to_path_buf();
+    fs::write(root.join("note.md"), "Content from the other pass.")?;
+    let embedder = test_embedder(None, None);
+    let report = run(
+        std::slice::from_ref(&root),
+        NonZeroUsize::new(1_000).unwrap(),
+        crate::config::DEFAULT_MAX_FILE_BYTES,
+        IndexOptions {
+            full: true,
+            ..Default::default()
+        },
+        &database,
+        &embedder,
+        &mut |event| match event {
+            ProgressEvent::Index {
+                event: IndexEvent::Cleared,
+                ..
+            } => {
+                assert!(index(&root, &database, &embedder).is_success());
+            }
+            ProgressEvent::Index {
+                event: IndexEvent::Scanning(_),
+                ..
+            } => {
+                panic!("full rebuild scanned after a competing write");
+            }
+            _ => {}
+        },
+    );
+    assert!(matches!(
+        report.publication,
+        PublicationStatus::NotPublished
+    ));
+    let reader = database::open_read_only(&database.sqlite_path())?;
+    assert!(database::vector_index(&reader)?.is_some());
+    Ok(())
 }
 
 /// Verify a second writer fails before scanning while the published index is searchable.
@@ -129,7 +260,7 @@ fn one_writer_per_database_allows_parallel_search() -> Result<()> {
         &[directory.path().to_path_buf()],
         NonZeroUsize::new(1_000).unwrap(),
         crate::config::DEFAULT_MAX_FILE_BYTES,
-        false,
+        IndexOptions::default(),
         &database,
         &embedder,
         &mut |event| {
@@ -148,7 +279,7 @@ fn one_writer_per_database_allows_parallel_search() -> Result<()> {
                 &[directory.path().to_path_buf()],
                 NonZeroUsize::new(1_000).unwrap(),
                 crate::config::DEFAULT_MAX_FILE_BYTES,
-                false,
+                IndexOptions::default(),
                 &database,
                 &embedder,
                 &mut |_| {},
@@ -301,7 +432,7 @@ fn chunk_size_mismatch_aborts_once_before_visiting_files() -> Result<()> {
             &[root.to_path_buf()],
             NonZeroUsize::new(500).unwrap(),
             crate::config::DEFAULT_MAX_FILE_BYTES,
-            false,
+            IndexOptions::default(),
             &database,
             &embedder,
             &mut |_| {},
@@ -519,7 +650,7 @@ fn publication_failure_returns_an_unpublished_report() -> Result<()> {
         &[new_root],
         NonZeroUsize::new(1_000).unwrap(),
         crate::config::DEFAULT_MAX_FILE_BYTES,
-        false,
+        IndexOptions::default(),
         &database,
         &embedder,
         &mut |event| match event {

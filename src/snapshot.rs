@@ -221,19 +221,19 @@ pub(crate) fn active_path(
     let stored = &active.settings;
     if stored.model != settings.model || stored.dimensions != settings.dimensions {
         return Err(io::Error::other(
-            "Embedding model or dimensions differ from the active index; use its settings or a new database path",
+            "Embedding model or dimensions differ from the active index; use its settings or rebuild with tb index --full",
         )
         .into());
     }
     if stored.model_digest != settings.model_digest {
         return Err(io::Error::other(format!(
-            "Embedding model digest differs from the active index (indexed {}, current {}); restore the indexed model or rebuild using a fresh database path",
+            "Embedding model digest differs from the active index (indexed {}, current {}); restore the indexed model or rebuild with tb index --full",
             stored.model_digest, settings.model_digest,
         )).into());
     }
     if stored.chunk_format != settings.chunk_format {
         return Err(io::Error::other(
-            "ollama.chunk_format differs from the active index; use its setting or a new database path",
+            "ollama.chunk_format differs from the active index; use its setting or rebuild with tb index --full",
         )
         .into());
     }

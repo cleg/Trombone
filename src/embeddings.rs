@@ -614,7 +614,7 @@ mod tests {
                 &roots,
                 chunk_size,
                 max_file_bytes,
-                false,
+                indexer::IndexOptions::default(),
                 &database,
                 &embedder,
                 &mut |_| {}
@@ -630,7 +630,7 @@ mod tests {
                 &roots,
                 chunk_size,
                 max_file_bytes,
-                false,
+                indexer::IndexOptions::default(),
                 &database,
                 &embedder,
                 &mut |_| {}
@@ -664,7 +664,7 @@ mod tests {
             &roots,
             chunk_size,
             max_file_bytes,
-            false,
+            indexer::IndexOptions::default(),
             &database,
             &embedder,
             &mut |_| {},
@@ -694,7 +694,7 @@ mod tests {
                 &roots,
                 chunk_size,
                 max_file_bytes,
-                false,
+                indexer::IndexOptions::default(),
                 &database,
                 &embedder,
                 &mut |_| {}

@@ -29,6 +29,10 @@ pub(crate) enum Commands {
         #[arg(long)]
         chunk_size: Option<NonZeroUsize>,
 
+        /// Delete the existing index before rebuilding from all configured roots
+        #[arg(long)]
+        full: bool,
+
         /// Skip automatic compaction for this indexing pass
         #[arg(long)]
         no_compact: bool,

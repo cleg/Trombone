@@ -5,8 +5,8 @@ use crate::database;
 use crate::embeddings::Embedder;
 use crate::error::Result;
 use crate::index_report::PublicationStatus;
-use crate::indexer::run;
 use crate::indexer::tests::{corpus, test_embedder};
+use crate::indexer::{IndexOptions, run};
 use crate::progress::ProgressEvent;
 use crate::snapshot;
 
@@ -75,7 +75,10 @@ fn check_automatic_compaction(holes: u64, surplus: u64) -> Result<()> {
         &roots,
         chunk_size,
         crate::config::DEFAULT_MAX_FILE_BYTES,
-        true,
+        IndexOptions {
+            no_compact: true,
+            ..Default::default()
+        },
         &database,
         &embedder,
         &mut |_| {},
@@ -103,7 +106,7 @@ fn check_automatic_compaction(holes: u64, surplus: u64) -> Result<()> {
         &roots,
         chunk_size,
         crate::config::DEFAULT_MAX_FILE_BYTES,
-        false,
+        IndexOptions::default(),
         &database,
         &embedder,
         &mut |event| {
@@ -134,7 +137,7 @@ fn check_automatic_compaction(holes: u64, surplus: u64) -> Result<()> {
         &roots,
         chunk_size,
         crate::config::DEFAULT_MAX_FILE_BYTES,
-        false,
+        IndexOptions::default(),
         &database,
         &embedder,
         &mut |_| {},

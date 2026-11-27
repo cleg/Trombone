@@ -335,7 +335,7 @@ mod tests {
             &[directory.path().to_path_buf()],
             NonZeroUsize::new(1_000).unwrap(),
             crate::config::DEFAULT_MAX_FILE_BYTES,
-            false,
+            crate::indexer::IndexOptions::default(),
             &database,
             &embedder,
             &mut |_| {},
@@ -673,7 +673,7 @@ mod tests {
             &[directory.path().to_path_buf()],
             NonZeroUsize::new(1_000).unwrap(),
             limit,
-            false,
+            crate::indexer::IndexOptions::default(),
             &database,
             &embedder,
             &mut |event| {

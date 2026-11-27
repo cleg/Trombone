@@ -35,6 +35,7 @@ impl Reporter {
                     IndexEvent::Opening(database) => {
                         self.stage(format_args!("Opening index in {}", path_label(database)))
                     }
+                    IndexEvent::Cleared => self.stage("Cleared the index for a full rebuild"),
                     IndexEvent::Scanning(root) => {
                         self.root = Some(root.to_path_buf());
                         self.stage(format_args!("Scanning Markdown in {}", path_label(root)));

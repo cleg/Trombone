@@ -24,6 +24,12 @@ use crate::walker::{self, WalkEvent, WalkOutcome};
 use self::document::process_file;
 use self::publication::publish_index;
 
+#[derive(Default)]
+pub(crate) struct IndexOptions {
+    pub(crate) full: bool,
+    pub(crate) no_compact: bool,
+}
+
 /// Index the files reachable from `roots` and reconcile the entire database.
 ///
 /// # Parameters
@@ -31,7 +37,7 @@ use self::publication::publish_index;
 /// - `roots` is the validated list of configured source directories.
 /// - `chunk_size` is the maximum chunk length in Unicode characters.
 /// - `max_file_bytes` is the maximum source file size in bytes read into memory.
-/// - `no_compact` skips automatic rebuilding for this pass.
+/// - `options` selects a full rebuild and controls automatic compaction.
 /// - `database` provides the SQLite and snapshot location.
 /// - `embedder` supplies model settings and generates chunk embeddings.
 /// - `emit` receives synchronous progress and diagnostic events.
@@ -39,13 +45,13 @@ use self::publication::publish_index;
 /// Returns an IndexReport for every attempt, including setup and publication
 /// failures. Recoverable errors can coexist with a published pass. Aborted passes
 /// keep their staged counts, report zero committed counts, and retain their
-/// diagnostics without requiring callers to interpret nested results.
+/// diagnostics. A full rebuild commits the reset before scanning.
 /// Automatic compaction failures emit a warning after successful publication.
 pub(crate) fn run(
     roots: &[PathBuf],
     chunk_size: NonZeroUsize,
     max_file_bytes: NonZeroU64,
-    no_compact: bool,
+    options: IndexOptions,
     database: &DatabaseConfig,
     embedder: &dyn Embedder,
     emit: &mut dyn FnMut(ProgressEvent<'_>),
@@ -60,6 +66,7 @@ pub(crate) fn run(
         roots,
         chunk_size,
         max_file_bytes,
+        options.full,
         database,
         embedder,
         &mut progress,
@@ -70,7 +77,7 @@ pub(crate) fn run(
             PublicationStatus::NotPublished
         }
     };
-    if !no_compact
+    if !options.no_compact
         && let PublicationStatus::Published {
             snapshot_updated,
             compacted,
@@ -93,6 +100,7 @@ pub(crate) fn run(
 /// `roots` defines the desired documents for the database. `chunk_size` limits
 /// chunk length in Unicode characters, and `max_file_bytes` caps each source
 /// file read into memory.
+/// If `full` is set, commits an empty index before beginning traversal.
 /// `database` locates storage, `embedder` supplies model settings and chunk
 /// embeddings, and `progress` records counters, deletion deferral, and events.
 /// Returns the publication outcome. Recoverable errors allow traversal to
@@ -110,14 +118,31 @@ fn execute(
     roots: &[PathBuf],
     chunk_size: NonZeroUsize,
     max_file_bytes: NonZeroU64,
+    full: bool,
     database: &DatabaseConfig,
     embedder: &dyn Embedder,
     progress: &mut IndexProgress<'_>,
 ) -> Result<PublicationStatus> {
     let mut connection = database::open(&database.sqlite_path())?;
-    // Acquire the writer lock before choosing a snapshot or allocating vector keys.
-    // Keep it through traversal, embedding calls, and publication.
     let mut transaction = database::begin_write(&mut connection)?;
+    let mut cleared_snapshot = false;
+    if full {
+        i64::try_from(chunk_size.get())?;
+        let version = database::data_version(&transaction)?;
+        cleared_snapshot = database::clear_index(&transaction)?;
+        transaction.commit()?;
+        progress.notify(IndexEvent::Cleared);
+
+        // The reset is visible to readers now. Detect any write in the gap
+        // before reacquiring the lock so the rebuild always starts empty.
+        transaction = database::begin_write(&mut connection)?;
+        if database::data_version(&transaction)? != version {
+            return Err(std::io::Error::other(
+                "Another connection wrote to the database after the reset; retry tb index --full",
+            )
+            .into());
+        }
+    }
     database::ensure_chunk_size(&transaction, chunk_size)?;
     let settings = embedder.settings();
     let active = database::vector_index(&transaction)?;
@@ -175,13 +200,20 @@ fn execute(
         progress.notify(IndexEvent::CheckingDeletions);
         database::delete_unseen_documents(&transaction, |path| progress.removal(path))?;
     }
-    publish_index(
+    let mut publication = publish_index(
         transaction,
         database,
         settings,
         previous.as_deref(),
         progress,
-    )
+    )?;
+    if let PublicationStatus::Published {
+        snapshot_updated, ..
+    } = &mut publication
+    {
+        *snapshot_updated |= cleared_snapshot;
+    }
+    Ok(publication)
 }
 
 #[cfg(test)]
